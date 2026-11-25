@@ -1,0 +1,392 @@
+{
+  "entities": {
+    "UserPublic": {
+      "title": "UserPublic",
+      "description": "Public non-PII profile and role record for a ROADSHADOW user.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "photoURL": { "type": "string", "maxLength": 512 },
+        "role": { "type": "string", "enum": ["ADMINISTRATOR", "ANALYST", "VIEWER"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Isolated PII and notification preferences accessible only to the owner or admin.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 256 },
+        "notifyCriticalEvents": { "type": "boolean" },
+        "notifyJobCompletion": { "type": "boolean" },
+        "notifyWeeklySummary": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "notifyCriticalEvents", "notifyJobCompletion", "notifyWeeklySummary", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted administrator grant record.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "grantedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "grantedAt"]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "Road safety study project grouping locations, cameras, videos, events, and reports.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "locationSummary": { "type": "string", "maxLength": 200 },
+        "selectedCameraId": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "startDate": { "type": "string", "maxLength": 32 },
+        "endDate": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["active", "archived"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "name", "description", "startDate", "status", "createdAt", "updatedAt"]
+    },
+    "Location": {
+      "title": "Location",
+      "description": "Monitored urban or semi-urban road location with validated coordinates.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 140 },
+        "address": { "type": "string", "maxLength": 260 },
+        "city": { "type": "string", "maxLength": 100 },
+        "state": { "type": "string", "maxLength": 100 },
+        "country": { "type": "string", "maxLength": 100 },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "locationType": {
+          "type": "string",
+          "enum": ["Intersection", "Highway", "School zone", "Hospital zone", "Commercial road", "Residential road", "Pedestrian crossing", "Other"]
+        },
+        "description": { "type": "string", "maxLength": 1000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "ownerId", "name", "city", "state", "country", "latitude", "longitude", "locationType", "createdAt", "updatedAt"]
+    },
+    "Camera": {
+      "title": "Camera",
+      "description": "Traffic monitoring camera metadata associated with a location (credentials never stored here).",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "cameraType": { "type": "string", "maxLength": 80 },
+        "direction": { "type": "string", "maxLength": 80 },
+        "resolution": { "type": "string", "maxLength": 40 },
+        "frameRate": { "type": "number" },
+        "installationDate": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["Active", "Inactive", "Offline", "Maintenance", "Not connected"] },
+        "description": { "type": "string", "maxLength": 800 },
+        "rtspAdapterEnabled": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "locationId", "ownerId", "name", "cameraType", "direction", "resolution", "status", "rtspAdapterEnabled", "createdAt", "updatedAt"]
+    },
+    "Video": {
+      "title": "Video",
+      "description": "Uploaded traffic video metadata record linked to project, location, and camera.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "cameraId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "fileName": { "type": "string", "maxLength": 200 },
+        "mimeType": { "type": "string", "enum": ["video/mp4", "video/quicktime", "video/webm"] },
+        "fileSizeBytes": { "type": "number" },
+        "fileUrl": { "type": "string", "maxLength": 512 },
+        "posterUrl": { "type": "string", "maxLength": 512 },
+        "width": { "type": "number" },
+        "height": { "type": "number" },
+        "fps": { "type": "number" },
+        "errorMessage": { "type": "string", "maxLength": 600 },
+        "recordingDate": { "type": "string", "maxLength": 32 },
+        "recordingTime": { "type": "string", "maxLength": 32 },
+        "roadType": { "type": "string", "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "durationSec": { "type": "number" },
+        "status": { "type": "string", "enum": ["Draft", "Uploading", "Uploaded", "Queued", "Processing", "Completed", "Failed", "Cancelled"] },
+        "isDemonstration": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "locationId", "cameraId", "ownerId", "title", "fileName", "mimeType", "fileSizeBytes", "fileUrl", "recordingDate", "recordingTime", "roadType", "durationSec", "status", "isDemonstration", "createdAt", "updatedAt"]
+    },
+    "ProcessingJob": {
+      "title": "ProcessingJob",
+      "description": "Asynchronous CV processing job metadata and summary metrics.",
+      "type": "object",
+      "properties": {
+        "videoId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "status": { "type": "string", "enum": ["Queued", "Processing", "Completed", "Failed", "Cancelled"] },
+        "progress": { "type": "number" },
+        "engineMode": { "type": "string", "enum": ["CV_SERVICE", "DEVELOPMENT_FALLBACK", "DEMONSTRATION", "UNAVAILABLE"] },
+        "modelVersion": { "type": "string", "maxLength": 120 },
+        "analyzedFrames": { "type": "number" },
+        "processingTimeMs": { "type": "number" },
+        "detectedObjectCount": { "type": "number" },
+        "trackingCount": { "type": "number" },
+        "conflictCount": { "type": "number" },
+        "errorMessage": { "type": "string", "maxLength": 600 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["videoId", "projectId", "ownerId", "status", "progress", "engineMode", "modelVersion", "analyzedFrames", "processingTimeMs", "detectedObjectCount", "trackingCount", "conflictCount", "createdAt", "updatedAt"]
+    },
+    "ConflictEvent": {
+      "title": "ConflictEvent",
+      "description": "Detected road-user near-miss / potential conflict event with separate AI output and human validation.",
+      "type": "object",
+      "properties": {
+        "videoId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "timestampSec": { "type": "number" },
+        "frameNumber": { "type": "number" },
+        "conflictType": {
+          "type": "string",
+          "enum": [
+            "Motorcycle versus turning car",
+            "Pedestrian versus vehicle",
+            "Unsafe merging",
+            "Crossing conflict",
+            "Wrong-direction movement",
+            "Sudden braking",
+            "Vehicle intersection conflict",
+            "Other potential conflict"
+          ]
+        },
+        "originalConflictType": {
+          "type": "string",
+          "enum": [
+            "Motorcycle versus turning car",
+            "Pedestrian versus vehicle",
+            "Unsafe merging",
+            "Crossing conflict",
+            "Wrong-direction movement",
+            "Sudden braking",
+            "Vehicle intersection conflict",
+            "Other potential conflict"
+          ]
+        },
+        "riskScore": { "type": "number" },
+        "riskCategory": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] },
+        "interactionTier": { "type": "string", "enum": ["Potential conflict", "Near miss"] },
+        "detectionConfidence": { "type": "number" },
+        "measurementQuality": { "type": "string", "enum": ["calibrated", "uncalibrated_pixel", "partial_occlusion"] },
+        "estimatedPetSec": { "type": "number" },
+        "evasiveManeuverDetected": { "type": "boolean" },
+        "occurredAt": { "type": "string", "maxLength": 64 },
+        "movementDirection": { "type": "string", "maxLength": 120 },
+        "involvedTrackIds": { "type": "array" },
+        "roadUsers": { "type": "array" },
+        "contributingFactors": { "type": "array" },
+        "measurementLimitations": { "type": "array" },
+        "evidenceSummary": { "type": "string", "maxLength": 1000 },
+        "validationStatus": { "type": "string", "enum": ["Pending review", "Verified", "False positive", "Uncertain", "Under investigation"] },
+        "analystNotes": { "type": "string", "maxLength": 1000 },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "aiExplanation": { "type": "string", "maxLength": 3000 },
+        "isDemonstration": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["videoId", "projectId", "locationId", "ownerId", "timestampSec", "frameNumber", "conflictType", "originalConflictType", "riskScore", "riskCategory", "detectionConfidence", "measurementQuality", "roadUsers", "contributingFactors", "measurementLimitations", "evidenceSummary", "validationStatus", "isDemonstration", "createdAt", "updatedAt"]
+    },
+    "ConflictFingerprint": {
+      "title": "ConflictFingerprint",
+      "description": "Aggregated recurring road-user conflict pattern across multiple observed events.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationName": { "type": "string", "maxLength": 160 },
+        "patternLabel": { "type": "string", "maxLength": 200 },
+        "conflictType": { "type": "string", "maxLength": 100 },
+        "roadUserCombo": { "type": "string", "maxLength": 120 },
+        "timeWindow": { "type": "string", "maxLength": 64 },
+        "dayOfWeekPattern": { "type": "string", "maxLength": 64 },
+        "movementDirection": { "type": "string", "maxLength": 80 },
+        "observedCount": { "type": "number" },
+        "isPreliminary": { "type": "boolean" },
+        "linkedEventIds": { "type": "array" },
+        "contributingFactors": { "type": "array" },
+        "suggestedInvestigation": { "type": "string", "maxLength": 800 },
+        "investigationStatus": { "type": "string", "enum": ["Monitoring", "Marked for investigation", "Mitigation planned", "Resolved"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "locationId", "ownerId", "locationName", "patternLabel", "conflictType", "roadUserCombo", "timeWindow", "observedCount", "isPreliminary", "linkedEventIds", "investigationStatus", "createdAt", "updatedAt"]
+    },
+    "Recommendation": {
+      "title": "Recommendation",
+      "description": "Evidence-based road safety recommendation tied to project, location, or conflict fingerprint.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 3, "maxLength": 180 },
+        "category": { "type": "string", "enum": ["Engineering", "Signal Timing", "Signage & Marking", "Enforcement", "Pedestrian Infrastructure"] },
+        "priority": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] },
+        "rationale": { "type": "string", "maxLength": 1500 },
+        "evidenceSummary": { "type": "string", "maxLength": 1000 },
+        "status": { "type": "string", "enum": ["Proposed", "Under review", "Approved", "Implemented", "Deferred"] },
+        "generatedByAi": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "locationId", "ownerId", "title", "category", "priority", "rationale", "evidenceSummary", "status", "generatedByAi", "createdAt", "updatedAt"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "Structured road safety analytical report with optional Gemini executive summary.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 3, "maxLength": 180 },
+        "reportType": { "type": "string", "enum": ["Location Safety Audit", "Conflict Fingerprint Brief", "Monthly Traffic Safety Review", "Executive Summary"] },
+        "dateRangeStart": { "type": "string", "maxLength": 32 },
+        "dateRangeEnd": { "type": "string", "maxLength": 32 },
+        "summary": { "type": "string", "maxLength": 4000 },
+        "aiExecutiveSummary": { "type": "string", "maxLength": 4000 },
+        "metricsSnapshot": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "ownerId", "title", "reportType", "dateRangeStart", "dateRangeEnd", "summary", "createdAt", "updatedAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "User notification record for processing jobs, reviews, and high-risk alerts.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "maxLength": 160 },
+        "message": { "type": "string", "maxLength": 500 },
+        "severity": { "type": "string", "enum": ["info", "warning", "critical", "success"] },
+        "read": { "type": "boolean" },
+        "linkPath": { "type": "string", "maxLength": 200 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "message", "severity", "read", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and action audit record.",
+      "type": "object",
+      "properties": {
+        "actorId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorRole": { "type": "string", "enum": ["ADMINISTRATOR", "ANALYST", "VIEWER"] },
+        "action": { "type": "string", "maxLength": 120 },
+        "targetType": { "type": "string", "maxLength": 80 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["actorId", "actorRole", "action", "targetType", "targetId", "details", "createdAt"]
+    },
+    "WorkspaceSetting": {
+      "title": "WorkspaceSetting",
+      "description": "User-owned workspace configuration for provisional risk bands and upload limits.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "lowMax": { "type": "number" },
+        "mediumMax": { "type": "number" },
+        "highMax": { "type": "number" },
+        "maxUploadMb": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "lowMax", "mediumMax", "highMax", "maxUploadMb", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublic" },
+      "description": "Public user profiles without PII."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivate" },
+      "description": "PII-isolated private user email and notification preferences."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Trusted admin role grants managed only by administrators."
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/Project" },
+      "description": "Road safety study projects."
+    },
+    "/locations/{locationId}": {
+      "schema": { "$ref": "#/entities/Location" },
+      "description": "Monitored road locations linked to projects."
+    },
+    "/cameras/{cameraId}": {
+      "schema": { "$ref": "#/entities/Camera" },
+      "description": "Monitored traffic cameras linked to locations."
+    },
+    "/videos/{videoId}": {
+      "schema": { "$ref": "#/entities/Video" },
+      "description": "Uploaded traffic video records."
+    },
+    "/processingJobs/{jobId}": {
+      "schema": { "$ref": "#/entities/ProcessingJob" },
+      "description": "Asynchronous CV video analysis jobs."
+    },
+    "/conflictEvents/{eventId}": {
+      "schema": { "$ref": "#/entities/ConflictEvent" },
+      "description": "Detected potential conflict events and human validation reviews."
+    },
+    "/conflictFingerprints/{fingerprintId}": {
+      "schema": { "$ref": "#/entities/ConflictFingerprint" },
+      "description": "Recurring conflict pattern fingerprints."
+    },
+    "/recommendations/{recommendationId}": {
+      "schema": { "$ref": "#/entities/Recommendation" },
+      "description": "Evidence-based road safety recommendations."
+    },
+    "/reports/{reportId}": {
+      "schema": { "$ref": "#/entities/Report" },
+      "description": "Generated road safety reports."
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "Per-user operational notifications."
+    },
+    "/auditLogs/{auditId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only operational audit logs."
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/WorkspaceSetting" },
+      "description": "Per-owner workspace risk scoring and upload settings."
+    }
+  }
+}

@@ -1,0 +1,659 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Hardened Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerified() && request.auth.token.email == 'akshitpatel2107@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwnerUid(uid) {
+      return isVerified() && request.auth.uid == uid;
+    }
+
+    function isProjectOwner(projectId) {
+      return exists(/databases/$(database)/documents/projects/$(projectId)) &&
+        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isValidStringList(listVal, maxItems) {
+      return listVal is list && listVal.size() <= maxItems && (listVal.size() == 0 || listVal[0] is string);
+    }
+
+    function isValidMetricsSnapshot(snap) {
+      return snap is map &&
+        snap.keys().hasAll(['videosAnalyzed', 'totalEvents', 'criticalEvents', 'highEvents', 'verifiedEvents', 'fingerprintsIdentified']) &&
+        snap.keys().hasOnly(['videosAnalyzed', 'totalEvents', 'criticalEvents', 'highEvents', 'verifiedEvents', 'fingerprintsIdentified']) &&
+        snap.videosAnalyzed is number && snap.videosAnalyzed >= 0 &&
+        snap.totalEvents is number && snap.totalEvents >= 0 &&
+        snap.criticalEvents is number && snap.criticalEvents >= 0 &&
+        snap.highEvents is number && snap.highEvents >= 0 &&
+        snap.verifiedEvents is number && snap.verifiedEvents >= 0 &&
+        snap.fingerprintsIdentified is number && snap.fingerprintsIdentified >= 0;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidUserPublic(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'role', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        isValidString(data.displayName, 1, 120) &&
+        isOptionalString(data, 'photoURL', 512) &&
+        data.role in ['ADMINISTRATOR', 'ANALYST', 'VIEWER'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['uid', 'email', 'notifyCriticalEvents', 'notifyJobCompletion', 'notifyWeeklySummary', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'notifyCriticalEvents', 'notifyJobCompletion', 'notifyWeeklySummary', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        isValidString(data.email, 3, 256) &&
+        data.notifyCriticalEvents is bool &&
+        data.notifyJobCompletion is bool &&
+        data.notifyWeeklySummary is bool &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'grantedAt']) &&
+        data.keys().hasOnly(['uid', 'grantedAt']) &&
+        isValidId(data.uid) &&
+        data.grantedAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'description', 'startDate', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'name', 'locationSummary', 'selectedCameraId', 'description', 'startDate', 'endDate', 'status', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.name, 2, 120) &&
+        isOptionalString(data, 'locationSummary', 200) &&
+        isOptionalString(data, 'selectedCameraId', 128) &&
+        isValidString(data.description, 0, 1000) &&
+        isValidString(data.startDate, 4, 32) &&
+        isOptionalString(data, 'endDate', 32) &&
+        data.status in ['active', 'archived'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidLocation(data) {
+      return data.keys().hasAll(['projectId', 'ownerId', 'name', 'city', 'state', 'country', 'latitude', 'longitude', 'locationType', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'ownerId', 'name', 'address', 'city', 'state', 'country', 'latitude', 'longitude', 'locationType', 'description', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.name, 2, 140) &&
+        isOptionalString(data, 'address', 260) &&
+        isValidString(data.city, 1, 100) &&
+        isValidString(data.state, 1, 100) &&
+        isValidString(data.country, 1, 100) &&
+        data.latitude is number && data.latitude >= -90 && data.latitude <= 90 &&
+        data.longitude is number && data.longitude >= -180 && data.longitude <= 180 &&
+        data.locationType in ['Intersection', 'Highway', 'School zone', 'Hospital zone', 'Commercial road', 'Residential road', 'Pedestrian crossing', 'Other'] &&
+        isOptionalString(data, 'description', 1000) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCamera(data) {
+      return data.keys().hasAll(['projectId', 'locationId', 'ownerId', 'name', 'cameraType', 'direction', 'resolution', 'status', 'rtspAdapterEnabled', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'locationId', 'ownerId', 'name', 'cameraType', 'direction', 'resolution', 'frameRate', 'installationDate', 'status', 'description', 'rtspAdapterEnabled', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.locationId) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.name, 2, 120) &&
+        isValidString(data.cameraType, 2, 80) &&
+        isValidString(data.direction, 1, 80) &&
+        isValidString(data.resolution, 3, 40) &&
+        (!('frameRate' in data) || (data.frameRate is number && data.frameRate >= 1 && data.frameRate <= 240)) &&
+        isOptionalString(data, 'installationDate', 32) &&
+        data.status in ['Active', 'Inactive', 'Offline', 'Maintenance', 'Not connected'] &&
+        isOptionalString(data, 'description', 800) &&
+        data.rtspAdapterEnabled is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidVideo(data) {
+      return data.keys().hasAll(['projectId', 'locationId', 'cameraId', 'ownerId', 'title', 'fileName', 'mimeType', 'fileSizeBytes', 'fileUrl', 'recordingDate', 'recordingTime', 'roadType', 'durationSec', 'status', 'isDemonstration', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'locationId', 'cameraId', 'ownerId', 'title', 'fileName', 'mimeType', 'fileSizeBytes', 'fileUrl', 'posterUrl', 'width', 'height', 'fps', 'errorMessage', 'recordingDate', 'recordingTime', 'latitude', 'longitude', 'roadType', 'description', 'durationSec', 'status', 'isDemonstration', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.locationId) &&
+        isValidId(data.cameraId) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.title, 1, 160) &&
+        isValidString(data.fileName, 1, 200) &&
+        data.mimeType in ['video/mp4', 'video/quicktime', 'video/webm'] &&
+        data.fileSizeBytes is number && data.fileSizeBytes >= 0 && data.fileSizeBytes <= 1073741824 &&
+        isValidString(data.fileUrl, 1, 512) &&
+        isOptionalString(data, 'posterUrl', 512) &&
+        (!('width' in data) || (data.width is number && data.width >= 0 && data.width <= 16384)) &&
+        (!('height' in data) || (data.height is number && data.height >= 0 && data.height <= 16384)) &&
+        (!('fps' in data) || (data.fps is number && data.fps >= 0 && data.fps <= 240)) &&
+        isOptionalString(data, 'errorMessage', 600) &&
+        isValidString(data.recordingDate, 4, 32) &&
+        isValidString(data.recordingTime, 4, 32) &&
+        (!('latitude' in data) || (data.latitude is number && data.latitude >= -90 && data.latitude <= 90)) &&
+        (!('longitude' in data) || (data.longitude is number && data.longitude >= -180 && data.longitude <= 180)) &&
+        isValidString(data.roadType, 2, 80) &&
+        isOptionalString(data, 'description', 1000) &&
+        data.durationSec is number && data.durationSec >= 0 && data.durationSec <= 86400 &&
+        data.status in ['Draft', 'Uploading', 'Uploaded', 'Queued', 'Processing', 'Completed', 'Failed', 'Cancelled'] &&
+        data.isDemonstration is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProcessingJob(data) {
+      return data.keys().hasAll(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'createdAt', 'updatedAt']) &&
+        isValidId(data.videoId) &&
+        isValidId(data.projectId) &&
+        isValidId(data.ownerId) &&
+        data.status in ['Queued', 'Processing', 'Completed', 'Failed', 'Cancelled'] &&
+        data.progress is number && data.progress >= 0 && data.progress <= 100 &&
+        data.engineMode in ['CV_SERVICE', 'DEVELOPMENT_FALLBACK', 'DEMONSTRATION', 'UNAVAILABLE'] &&
+        isValidString(data.modelVersion, 2, 120) &&
+        data.analyzedFrames is number && data.analyzedFrames >= 0 &&
+        data.processingTimeMs is number && data.processingTimeMs >= 0 &&
+        data.detectedObjectCount is number && data.detectedObjectCount >= 0 &&
+        data.trackingCount is number && data.trackingCount >= 0 &&
+        data.conflictCount is number && data.conflictCount >= 0 &&
+        (!('warnings' in data) || isValidStringList(data.warnings, 20)) &&
+        isOptionalString(data, 'errorMessage', 600) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidConflictType(val) {
+      return val in [
+        'Motorcycle versus turning car',
+        'Pedestrian versus vehicle',
+        'Unsafe merging',
+        'Crossing conflict',
+        'Wrong-direction movement',
+        'Sudden braking',
+        'Vehicle intersection conflict',
+        'Other potential conflict'
+      ];
+    }
+
+    function isValidConflictEvent(data) {
+      return data.keys().hasAll(['videoId', 'projectId', 'locationId', 'ownerId', 'timestampSec', 'frameNumber', 'conflictType', 'originalConflictType', 'riskScore', 'riskCategory', 'detectionConfidence', 'measurementQuality', 'roadUsers', 'contributingFactors', 'measurementLimitations', 'evidenceSummary', 'validationStatus', 'isDemonstration', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'locationId', 'ownerId', 'timestampSec', 'frameNumber', 'occurredAt', 'conflictType', 'originalConflictType', 'riskScore', 'riskCategory', 'interactionTier', 'detectionConfidence', 'measurementQuality', 'estimatedTtcSec', 'estimatedPetSec', 'evasiveManeuverDetected', 'estimatedMinSeparationPx', 'relativeSpeedPxPerSec', 'trajectoryConvergenceDeg', 'movementDirection', 'roadUsers', 'involvedTrackIds', 'contributingFactors', 'measurementLimitations', 'evidenceSummary', 'validationStatus', 'analystNotes', 'reviewedBy', 'aiExplanation', 'isDemonstration', 'createdAt', 'updatedAt']) &&
+        isValidId(data.videoId) &&
+        isValidId(data.projectId) &&
+        isValidId(data.locationId) &&
+        isValidId(data.ownerId) &&
+        data.timestampSec is number && data.timestampSec >= 0 &&
+        data.frameNumber is number && data.frameNumber >= 0 &&
+        isOptionalString(data, 'occurredAt', 64) &&
+        isValidConflictType(data.conflictType) &&
+        isValidConflictType(data.originalConflictType) &&
+        data.riskScore is number && data.riskScore >= 0 && data.riskScore <= 100 &&
+        data.riskCategory in ['Low', 'Medium', 'High', 'Critical'] &&
+        (!('interactionTier' in data) || data.interactionTier in ['Potential conflict', 'Near miss']) &&
+        data.detectionConfidence is number && data.detectionConfidence >= 0 && data.detectionConfidence <= 1 &&
+        data.measurementQuality in ['calibrated', 'uncalibrated_pixel', 'partial_occlusion'] &&
+        (!('estimatedTtcSec' in data) || data.estimatedTtcSec == null || data.estimatedTtcSec is number) &&
+        (!('estimatedPetSec' in data) || data.estimatedPetSec == null || data.estimatedPetSec is number) &&
+        (!('evasiveManeuverDetected' in data) || data.evasiveManeuverDetected is bool) &&
+        (!('estimatedMinSeparationPx' in data) || data.estimatedMinSeparationPx == null || data.estimatedMinSeparationPx is number) &&
+        (!('relativeSpeedPxPerSec' in data) || data.relativeSpeedPxPerSec == null || data.relativeSpeedPxPerSec is number) &&
+        (!('trajectoryConvergenceDeg' in data) || data.trajectoryConvergenceDeg == null || data.trajectoryConvergenceDeg is number) &&
+        isOptionalString(data, 'movementDirection', 120) &&
+        isValidStringList(data.roadUsers, 10) &&
+        (!('involvedTrackIds' in data) || isValidStringList(data.involvedTrackIds, 10)) &&
+        isValidStringList(data.contributingFactors, 12) &&
+        isValidStringList(data.measurementLimitations, 12) &&
+        isValidString(data.evidenceSummary, 1, 1000) &&
+        data.validationStatus in ['Pending review', 'Verified', 'False positive', 'Uncertain', 'Under investigation'] &&
+        isOptionalString(data, 'analystNotes', 1000) &&
+        isOptionalString(data, 'reviewedBy', 128) &&
+        isOptionalString(data, 'aiExplanation', 3000) &&
+        data.isDemonstration is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidConflictFingerprint(data) {
+      return data.keys().hasAll(['projectId', 'locationId', 'ownerId', 'locationName', 'patternLabel', 'conflictType', 'roadUserCombo', 'timeWindow', 'observedCount', 'isPreliminary', 'linkedEventIds', 'investigationStatus', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'locationId', 'ownerId', 'locationName', 'patternLabel', 'conflictType', 'roadUserCombo', 'timeWindow', 'dayOfWeekPattern', 'movementDirection', 'observedCount', 'isPreliminary', 'riskDistribution', 'linkedEventIds', 'contributingFactors', 'suggestedInvestigation', 'investigationStatus', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.locationId) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.locationName, 1, 160) &&
+        isValidString(data.patternLabel, 2, 200) &&
+        isValidString(data.conflictType, 2, 100) &&
+        isValidString(data.roadUserCombo, 2, 120) &&
+        isValidString(data.timeWindow, 2, 64) &&
+        isOptionalString(data, 'dayOfWeekPattern', 64) &&
+        isOptionalString(data, 'movementDirection', 80) &&
+        data.observedCount is number && data.observedCount >= 2 &&
+        data.isPreliminary is bool &&
+        isValidStringList(data.linkedEventIds, 200) &&
+        (!('contributingFactors' in data) || isValidStringList(data.contributingFactors, 12)) &&
+        isOptionalString(data, 'suggestedInvestigation', 800) &&
+        data.investigationStatus in ['Monitoring', 'Marked for investigation', 'Mitigation planned', 'Resolved'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRecommendation(data) {
+      return data.keys().hasAll(['projectId', 'locationId', 'ownerId', 'title', 'category', 'priority', 'rationale', 'evidenceSummary', 'status', 'generatedByAi', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'locationId', 'fingerprintId', 'ownerId', 'title', 'category', 'priority', 'rationale', 'evidenceSummary', 'implementationSteps', 'status', 'generatedByAi', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.locationId) &&
+        isOptionalString(data, 'fingerprintId', 128) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.title, 3, 180) &&
+        data.category in ['Engineering', 'Signal Timing', 'Signage & Marking', 'Enforcement', 'Pedestrian Infrastructure'] &&
+        data.priority in ['Critical', 'High', 'Medium', 'Low'] &&
+        isValidString(data.rationale, 3, 1500) &&
+        isValidString(data.evidenceSummary, 3, 1000) &&
+        (!('implementationSteps' in data) || isValidStringList(data.implementationSteps, 12)) &&
+        data.status in ['Proposed', 'Under review', 'Approved', 'Implemented', 'Deferred'] &&
+        data.generatedByAi is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidReport(data) {
+      return data.keys().hasAll(['projectId', 'ownerId', 'title', 'reportType', 'dateRangeStart', 'dateRangeEnd', 'summary', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['projectId', 'ownerId', 'title', 'reportType', 'dateRangeStart', 'dateRangeEnd', 'summary', 'aiExecutiveSummary', 'includedLocationIds', 'metricsSnapshot', 'createdAt', 'updatedAt']) &&
+        isValidId(data.projectId) &&
+        isValidId(data.ownerId) &&
+        isValidString(data.title, 3, 180) &&
+        data.reportType in ['Location Safety Audit', 'Conflict Fingerprint Brief', 'Monthly Traffic Safety Review', 'Executive Summary'] &&
+        isValidString(data.dateRangeStart, 4, 32) &&
+        isValidString(data.dateRangeEnd, 4, 32) &&
+        isValidString(data.summary, 3, 4000) &&
+        isOptionalString(data, 'aiExecutiveSummary', 4000) &&
+        (!('includedLocationIds' in data) || isValidStringList(data.includedLocationIds, 50)) &&
+        (!('metricsSnapshot' in data) || isValidMetricsSnapshot(data.metricsSnapshot)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['userId', 'title', 'message', 'severity', 'read', 'createdAt']) &&
+        data.keys().hasOnly(['userId', 'title', 'message', 'severity', 'read', 'linkPath', 'createdAt']) &&
+        isValidId(data.userId) &&
+        isValidString(data.title, 1, 160) &&
+        isValidString(data.message, 1, 500) &&
+        data.severity in ['info', 'warning', 'critical', 'success'] &&
+        data.read is bool &&
+        isOptionalString(data, 'linkPath', 200) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['actorId', 'actorRole', 'action', 'targetType', 'targetId', 'details', 'createdAt']) &&
+        data.keys().hasOnly(['actorId', 'actorRole', 'action', 'targetType', 'targetId', 'details', 'createdAt']) &&
+        isValidId(data.actorId) &&
+        data.actorRole in ['ADMINISTRATOR', 'ANALYST', 'VIEWER'] &&
+        isValidString(data.action, 2, 120) &&
+        isValidString(data.targetType, 2, 80) &&
+        isValidString(data.targetId, 1, 128) &&
+        isValidString(data.details, 1, 500) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidWorkspaceSetting(data) {
+      return data.keys().hasAll(['ownerId', 'lowMax', 'mediumMax', 'highMax', 'maxUploadMb', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'lowMax', 'mediumMax', 'highMax', 'maxUploadMb', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        data.lowMax is number && data.lowMax >= 10 && data.lowMax <= 40 &&
+        data.mediumMax is number && data.mediumMax > data.lowMax && data.mediumMax <= 65 &&
+        data.highMax is number && data.highMax > data.mediumMax && data.highMax <= 90 &&
+        data.maxUploadMb is number && data.maxUploadMb >= 10 && data.maxUploadMb <= 1024 &&
+        data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwnerUid(userId) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerified() && resource.data.uid == request.auth.uid);
+      allow create: if isVerified() && isValidId(userId) && isValidUserPublic(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (request.auth.uid == userId && incoming().role in ['ANALYST', 'VIEWER']) ||
+          isAdmin()
+        );
+      allow update: if isVerified() && isValidId(userId) && isValidUserPublic(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            request.auth.uid == userId &&
+            incoming().role == existing().role &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // PII-Isolated Private Subcollection
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId) && (isOwnerUid(userId) || isAdmin());
+        allow list: if isVerified() && (request.auth.uid == userId || isBootstrappedAdmin());
+        allow create: if isVerified() && isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) &&
+          incoming().uid == userId &&
+          incoming().updatedAt == request.time &&
+          (request.auth.uid == userId || isAdmin());
+        allow update: if isVerified() && isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().updatedAt == request.time && (
+            isAdmin() ||
+            (
+              request.auth.uid == userId &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['email', 'notifyCriticalEvents', 'notifyJobCompletion', 'notifyWeeklySummary', 'updatedAt'])
+            )
+          );
+        allow delete: if isValidId(userId) && isValidId(docId) && isAdmin();
+      }
+    }
+
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && (isOwnerUid(adminUid) || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerified() && isValidId(adminUid) && isValidAdminRecord(incoming()) &&
+        incoming().uid == adminUid &&
+        incoming().grantedAt == request.time &&
+        isAdmin();
+      allow update: if false;
+      allow delete: if isValidId(adminUid) && isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(projectId) && isValidProject(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(projectId) && isValidProject(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'locationSummary', 'selectedCameraId', 'description', 'startDate', 'endDate', 'status', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(projectId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /locations/{locationId} {
+      allow get: if isValidId(locationId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(locationId) && isValidLocation(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(locationId) && isValidLocation(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'address', 'city', 'state', 'country', 'latitude', 'longitude', 'locationType', 'description', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(locationId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /cameras/{cameraId} {
+      allow get: if isValidId(cameraId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(cameraId) && isValidCamera(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin()) &&
+        exists(/databases/$(database)/documents/locations/$(incoming().locationId));
+      allow update: if isVerified() && isValidId(cameraId) && isValidCamera(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['locationId', 'name', 'cameraType', 'direction', 'resolution', 'frameRate', 'installationDate', 'status', 'description', 'rtspAdapterEnabled', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(cameraId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /videos/{videoId} {
+      allow get: if isValidId(videoId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(videoId) && isValidVideo(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(videoId) && isValidVideo(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'status', 'durationSec', 'posterUrl', 'width', 'height', 'fps', 'errorMessage', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(videoId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /processingJobs/{jobId} {
+      allow get: if isValidId(jobId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(jobId) && isValidProcessingJob(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(jobId) && isValidProcessingJob(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().videoId == existing().videoId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            !(existing().status in ['Completed', 'Failed', 'Cancelled']) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'progress', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(jobId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /conflictEvents/{eventId} {
+      allow get: if isValidId(eventId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(eventId) && isValidConflictEvent(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(eventId) && isValidConflictEvent(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().videoId == existing().videoId &&
+        incoming().originalConflictType == existing().originalConflictType &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['conflictType', 'validationStatus', 'analystNotes', 'reviewedBy', 'aiExplanation', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(eventId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /conflictFingerprints/{fingerprintId} {
+      allow get: if isValidId(fingerprintId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(fingerprintId) && isValidConflictFingerprint(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(fingerprintId) && isValidConflictFingerprint(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['investigationStatus', 'suggestedInvestigation', 'observedCount', 'isPreliminary', 'linkedEventIds', 'riskDistribution', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(fingerprintId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /recommendations/{recommendationId} {
+      allow get: if isValidId(recommendationId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(recommendationId) && isValidRecommendation(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(recommendationId) && isValidRecommendation(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'category', 'priority', 'rationale', 'evidenceSummary', 'implementationSteps', 'status', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(recommendationId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /reports/{reportId} {
+      allow get: if isValidId(reportId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(reportId) && isValidReport(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(reportId) && isValidReport(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().projectId == existing().projectId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'summary', 'aiExecutiveSummary', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(reportId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && (isOwnerUid(existing().userId) || isAdmin());
+      allow list: if isVerified() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(notificationId) && isValidNotification(incoming()) &&
+        incoming().userId == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isVerified() && isValidId(notificationId) && isValidNotification(incoming()) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt && (
+          isAdmin() ||
+          (
+            existing().userId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+          )
+        );
+      allow delete: if isValidId(notificationId) && (isOwnerUid(existing().userId) || isAdmin());
+    }
+
+    match /auditLogs/{auditId} {
+      allow get: if isValidId(auditId) && isAdmin();
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerified() && isValidId(auditId) && isValidAuditLog(incoming()) &&
+        incoming().actorId == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(settingId) && isValidWorkspaceSetting(incoming()) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(settingId) && isValidWorkspaceSetting(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['lowMax', 'mediumMax', 'highMax', 'maxUploadMb', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(settingId) && isAdmin();
+    }
+  }
+}

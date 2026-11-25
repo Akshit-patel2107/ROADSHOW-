@@ -1,0 +1,8 @@
+{
+  "name": "ROADSHADOW",
+  "description": "AI-powered intelligent road safety and traffic analytics platform turning road near-misses into preventive safety intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
