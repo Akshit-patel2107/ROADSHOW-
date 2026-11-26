@@ -126,30 +126,56 @@
         "roadType": { "type": "string", "maxLength": 80 },
         "description": { "type": "string", "maxLength": 1000 },
         "durationSec": { "type": "number" },
-        "status": { "type": "string", "enum": ["Draft", "Uploading", "Uploaded", "Queued", "Processing", "Completed", "Failed", "Cancelled"] },
+        "status": { "type": "string", "enum": ["Draft", "Uploading", "Uploaded", "Queued", "Analyzing", "Processing", "AI Analysis", "Saving Results", "Completed", "Failed", "Cancelled"] },
         "isDemonstration": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["projectId", "locationId", "cameraId", "ownerId", "title", "fileName", "mimeType", "fileSizeBytes", "fileUrl", "recordingDate", "recordingTime", "roadType", "durationSec", "status", "isDemonstration", "createdAt", "updatedAt"]
     },
-    "ProcessingJob": {
-      "title": "ProcessingJob",
-      "description": "Asynchronous CV processing job metadata and summary metrics.",
+    "VideoAnalysis": {
+      "title": "VideoAnalysis",
+      "description": "Structured Gemini multimodal video analysis results and optional trajectory metadata for an uploaded video.",
       "type": "object",
       "properties": {
         "videoId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "status": { "type": "string", "enum": ["Queued", "Processing", "Completed", "Failed", "Cancelled"] },
+        "jobId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "modelVersion": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "engineMode": { "type": "string", "enum": ["GEMINI_AI", "CV_SERVICE", "DEVELOPMENT_FALLBACK", "DEMONSTRATION"] },
+        "videoMetadata": { "type": "object" },
+        "detectionsSummary": { "type": "object" },
+        "geminiAnalysis": { "type": "object" },
+        "tracks": { "type": "array" },
+        "detections": { "type": "array" },
+        "trajectories": { "type": "array" },
+        "conflicts": { "type": "array" },
+        "thresholds": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["videoId", "projectId", "ownerId", "jobId", "modelVersion", "engineMode", "detectionsSummary", "tracks", "detections", "trajectories", "conflicts", "createdAt", "updatedAt"]
+    },
+    "ProcessingJob": {
+      "title": "ProcessingJob",
+      "description": "Asynchronous Gemini AI video analysis job metadata and summary metrics.",
+      "type": "object",
+      "properties": {
+        "videoId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "status": { "type": "string", "enum": ["Queued", "Analyzing", "Processing", "AI Analysis", "Saving Results", "Completed", "Failed", "Cancelled"] },
         "progress": { "type": "number" },
-        "engineMode": { "type": "string", "enum": ["CV_SERVICE", "DEVELOPMENT_FALLBACK", "DEMONSTRATION", "UNAVAILABLE"] },
+        "stageMessage": { "type": "string", "maxLength": 300 },
+        "engineMode": { "type": "string", "enum": ["GEMINI_AI", "CV_SERVICE", "DEVELOPMENT_FALLBACK", "DEMONSTRATION", "UNAVAILABLE"] },
         "modelVersion": { "type": "string", "maxLength": 120 },
         "analyzedFrames": { "type": "number" },
         "processingTimeMs": { "type": "number" },
         "detectedObjectCount": { "type": "number" },
         "trackingCount": { "type": "number" },
         "conflictCount": { "type": "number" },
+        "warnings": { "type": "array" },
         "errorMessage": { "type": "string", "maxLength": 600 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -193,6 +219,9 @@
             "Other potential conflict"
           ]
         },
+        "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+        "locationXy": { "type": "array" },
+        "detectionMethod": { "type": "string", "maxLength": 80 },
         "riskScore": { "type": "number" },
         "riskCategory": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] },
         "interactionTier": { "type": "string", "enum": ["Potential conflict", "Near miss"] },
@@ -356,9 +385,13 @@
       "schema": { "$ref": "#/entities/Video" },
       "description": "Uploaded traffic video records."
     },
+    "/videoAnalyses/{videoId}": {
+      "schema": { "$ref": "#/entities/VideoAnalysis" },
+      "description": "Structured Gemini multimodal video analysis results linked to uploaded videos."
+    },
     "/processingJobs/{jobId}": {
       "schema": { "$ref": "#/entities/ProcessingJob" },
-      "description": "Asynchronous CV video analysis jobs."
+      "description": "Asynchronous Gemini AI video analysis jobs."
     },
     "/conflictEvents/{eventId}": {
       "schema": { "$ref": "#/entities/ConflictEvent" },

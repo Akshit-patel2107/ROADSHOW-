@@ -101,17 +101,13 @@ export function LiveAnalysisPage() {
             />
             <div>
               <h2 className="text-base font-semibold text-[#F5F8FC]">
-                External CV Stream Ingestion Status:{' '}
+                Live RTSP Stream Ingestion Status:{' '}
                 {serverHealth.cvAdapter.rtspIngestionReady
                   ? 'Connected'
-                  : serverHealth.cvAdapter.status === 'unavailable'
-                    ? 'CV Worker Unreachable'
-                    : 'Not Connected (Upload Mode Active)'}
+                  : 'Upload-Based Gemini AI Mode Active'}
               </h2>
               <p className="text-sm text-[#A9B8CA] mt-1 leading-relaxed">
-                {serverHealth.cvAdapter.rtspIngestionReady
-                  ? `External Python FastAPI CV Worker is reachable via CV_SERVICE_URL (${serverHealth.cvAdapter.modelVersion || 'YOLO + ByteTrack'}) for authenticated RTSP stream probing and ingestion.`
-                  : 'ROADSHADOW runs on uploaded traffic footage (MP4/MOV/WebM) until an external CV worker is connected. Deploy the included Python FastAPI + OpenCV + YOLO/ByteTrack worker (cv_worker/main.py) inside the municipal network and configure CV_SERVICE_URL and CV_SERVICE_API_KEY in server environment variables.'}
+                ROADSHADOW currently performs real multimodal video analysis on uploaded traffic footage (MP4/MOV/WebM) using the server-side Gemini AI engine ({serverHealth.cvAdapter.modelVersion || 'gemini-4-hydrogen'}). Continuous live RTSP stream decoding is not active in this runtime; use Upload Video to analyse recorded junction clips.
               </p>
             </div>
           </div>
@@ -146,10 +142,10 @@ export function LiveAnalysisPage() {
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3 pt-4 border-t border-[#233B56] text-xs">
           {[
-            { step: '01. Municipal Camera', detail: 'Authenticated RTSP/RTSPS stream stays inside private NVR subnet.' },
-            { step: '02. Python FastAPI Worker', detail: 'cv_worker/main.py decodes frames via OpenCV + YOLO + ByteTrack.' },
-            { step: '03. Trajectory Engine', detail: 'Computes pixel/calibrated separation, convergence, and provisional risk.' },
-            { step: '04. Cloud Firestore', detail: 'Stores structured conflict events only — never exposing RTSP credentials.' },
+            { step: '01. Traffic Footage', detail: 'Upload recorded MP4, MOV, or WebM clips from roadside cameras or NVR exports.' },
+            { step: '02. Metadata & Storage', detail: 'Express server validates clips with ffprobe, extracts a poster frame, and stores video safely.' },
+            { step: '03. Gemini AI Analysis', detail: 'Server uploads clip to Gemini Files API and returns validated summaries, objects, and timestamped events.' },
+            { step: '04. Cloud Firestore', detail: 'Persists structured analysis records and conflict events cleanly — never exposing API keys.' },
           ].map((item) => (
             <div key={item.step} className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
               <p className="font-semibold text-[#F5F8FC]">{item.step}</p>
@@ -168,11 +164,11 @@ export function LiveAnalysisPage() {
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-5 h-5 text-[#45B5FF]" />
             <h2 className="text-base font-semibold text-[#F5F8FC]">
-              Validate RTSP Processing Adapter
+              Validate RTSP Stream Policy
             </h2>
           </div>
           <p className="text-xs text-[#A9B8CA]">
-            Checks camera stream host security policy on the server and actively probes the stream through the CV worker when available — never persisting or returning credentials to client state.
+            Checks camera stream host security policy on the server without persisting or returning credentials to client state.
           </p>
 
           <div>

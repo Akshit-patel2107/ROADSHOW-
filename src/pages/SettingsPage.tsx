@@ -1,16 +1,22 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Activity,
+  AlertTriangle,
   Archive,
   Bell,
+  CheckCircle2,
   FolderKanban,
   KeyRound,
   Pencil,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
+  Server,
   Sliders,
   Trash2,
   User,
+  XCircle,
 } from 'lucide-react';
 import { useRoadshadow } from '../context/RoadshadowContext';
 import { ConfirmDialog } from '../components/ToastContainer';
@@ -23,6 +29,8 @@ export function SettingsPage() {
     isDemoMode,
     projects,
     settings,
+    serverHealth,
+    refreshServerHealth,
     updateCurrentUserProfile,
     requestPasswordReset,
     createProject,
@@ -38,6 +46,8 @@ export function SettingsPage() {
   const canManageSettings = currentUser
     ? canPerformAction(currentUser.role, 'manage_settings')
     : false;
+
+  const [checkingCvHealth, setCheckingCvHealth] = useState(false);
 
   // Profile state
   const [displayName, setDisplayName] = useState(currentUser?.displayName ?? '');
@@ -206,9 +216,139 @@ export function SettingsPage() {
           Settings &amp; Project Administration
         </h1>
         <p className="text-sm text-[#A9B8CA] mt-1">
-          Manage your profile, alert preferences, safety study projects, and provisional risk scoring band boundaries.
+          Verify computer vision service health, manage your profile, safety study projects, and provisional risk scoring band boundaries.
         </p>
       </div>
+
+      {/* 0. Gemini AI Video Analysis Engine Health Check (/api/health) */}
+      <section
+        data-testid="cv-service-health-section"
+        className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-4"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#233B56] pb-3.5">
+          <div>
+            <h2 className="text-base font-semibold text-[#F5F8FC] flex items-center gap-2">
+              <Server className="w-4 h-4 text-[#45B5FF]" aria-hidden="true" />
+              Gemini AI Video Analysis Engine Health (<span className="font-mono text-[#45B5FF]">/api/health</span>)
+            </h2>
+            <p className="text-xs text-[#A9B8CA] mt-0.5">
+              Server-side connectivity check for multimodal video analysis powered by{' '}
+              <span className="font-mono text-[#F5F8FC]">@google/genai</span> and{' '}
+              <span className="font-mono text-[#F5F8FC]">GEMINI_API_KEY</span>.
+            </p>
+          </div>
+          <button
+            type="button"
+            data-testid="run-cv-health-check-btn"
+            disabled={checkingCvHealth}
+            onClick={async () => {
+              setCheckingCvHealth(true);
+              try {
+                const fresh = await refreshServerHealth(true);
+                pushToast({
+                  type:
+                    fresh.cvAdapter.status === 'available'
+                      ? 'success'
+                      : fresh.cvAdapter.status === 'unavailable'
+                        ? 'error'
+                        : 'warning',
+                  title:
+                    fresh.cvAdapter.status === 'available'
+                      ? 'Gemini AI Engine Ready'
+                      : fresh.cvAdapter.status === 'unavailable'
+                        ? 'Gemini API Connection Issue'
+                        : 'GEMINI_API_KEY Not Configured',
+                  description: fresh.cvAdapter.message,
+                });
+              } finally {
+                setCheckingCvHealth(false);
+              }
+            }}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#2585FF] hover:bg-[#1C74E8] disabled:opacity-60 text-white rounded-md transition-colors self-start sm:self-auto whitespace-nowrap"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${checkingCvHealth ? 'animate-spin' : ''}`} aria-hidden="true" />
+            {checkingCvHealth ? 'Checking AI Engine...' : 'Run Health Check'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          <div className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+            <p className="text-[#A9B8CA]">Engine Status</p>
+            <p
+              data-testid="cv-health-status-value"
+              className={`mt-1.5 font-mono font-semibold flex items-center gap-1.5 ${
+                serverHealth.cvAdapter.status === 'available'
+                  ? 'text-[#22C55E]'
+                  : serverHealth.cvAdapter.status === 'unavailable'
+                    ? 'text-[#E5484D]'
+                    : 'text-[#EAB308]'
+              }`}
+            >
+              {serverHealth.cvAdapter.status === 'available' ? (
+                <>
+                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  AVAILABLE
+                </>
+              ) : serverHealth.cvAdapter.status === 'unavailable' ? (
+                <>
+                  <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  UNAVAILABLE
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  NOT CONFIGURED
+                </>
+              )}
+            </p>
+          </div>
+
+          <div className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+            <p className="text-[#A9B8CA]">Active Model</p>
+            <p className="mt-1.5 font-mono text-[#F5F8FC] truncate">
+              {serverHealth.cvAdapter.modelVersion || 'Not configured'}
+            </p>
+          </div>
+
+          <div className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+            <p className="text-[#A9B8CA]">API Latency &amp; Mode</p>
+            <p className="mt-1.5 font-mono tabular-nums text-[#F5F8FC]">
+              {serverHealth.cvAdapter.latencyMs !== null && serverHealth.cvAdapter.latencyMs !== undefined
+                ? `${serverHealth.cvAdapter.latencyMs} ms`
+                : 'Ready'}
+              {' · Async Jobs'}
+            </p>
+          </div>
+
+          <div className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+            <p className="text-[#A9B8CA]">Supported Formats</p>
+            <p className="mt-1.5 font-mono text-[#F5F8FC]">
+              MP4 · MOV · WebM ({serverHealth.maxUploadMb} MB)
+            </p>
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-2 text-xs">
+          <div className="flex items-start gap-2">
+            <Activity className="w-4 h-4 text-[#45B5FF] shrink-0 mt-0.5" aria-hidden="true" />
+            <p className="text-[#F5F8FC] leading-relaxed">
+              {serverHealth.cvAdapter.message ||
+                'Run a health check to verify live server-side Gemini API readiness.'}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pl-6 text-[11px] text-[#A9B8CA]">
+            <span>
+              Server-side only: <span className="font-mono">GEMINI_API_KEY</span> is read strictly from backend environment variables and never exposed to the browser.
+            </span>
+            {serverHealth.cvAdapter.checkedAt && (
+              <span className="font-mono tabular-nums">
+                Last checked: {new Date(serverHealth.cvAdapter.checkedAt).toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
 
       {/* 1. Profile & Notification Preferences */}
       <section className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-5">

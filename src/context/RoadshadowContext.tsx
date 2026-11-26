@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, type User as FirebaseUser } from 'firebase/auth';
 import {
   collection,
@@ -45,6 +45,7 @@ import type {
   UserProfile,
   UserRole,
   ValidationStatus,
+  VideoAnalysisRecord,
   VideoRecord,
   WorkspaceSettings,
 } from '../types/roadshadow';
@@ -78,11 +79,17 @@ export interface ServerHealthStatus {
   maxUploadMb: number;
   cvAdapter: {
     status: 'available' | 'unavailable' | 'not_configured';
-    mode: 'CV_SERVICE' | 'UNAVAILABLE' | 'DEVELOPMENT_FALLBACK';
+    mode: 'GEMINI_AI' | 'CV_SERVICE' | 'UNAVAILABLE' | 'DEVELOPMENT_FALLBACK';
     externalWorkerConfigured: boolean;
     workerReachable: boolean;
     rtspIngestionReady: boolean;
     modelVersion?: string | null;
+    tracker?: string | null;
+    device?: string | null;
+    sampleFps?: number | null;
+    classes?: string[] | null;
+    asyncJobsSupported?: boolean;
+    supportedFormats?: string[] | null;
     latencyMs?: number | null;
     message?: string;
     checkedAt?: string;
@@ -171,8 +178,9 @@ interface RoadshadowContextValue {
   }) => Promise<void>;
   deleteVideo: (videoId: string) => Promise<void>;
   retryVideoAnalysis: (
-    videoId: string
-  ) => Promise<{ ok: boolean; status: string; error?: string }>;
+    videoId: string,
+    onProgress?: (job: ProcessingJob) => void
+  ) => Promise<{ ok: boolean; status: string; error?: string; job?: ProcessingJob }>;
 
   reviewConflictEvent: (
     eventId: string,
@@ -276,17 +284,19 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
       rtspIngestionReady: false,
       modelVersion: null,
       latencyMs: null,
-      message: 'Checking computer vision service status...',
+      message: 'Checking Gemini AI video analysis engine status...',
     },
     sumoConfigured: false,
     geminiConfigured: false,
   });
+  const retryingVideoIdsRef = useRef<Set<string>>(new Set());
 
   // Domain states
   const [projects, setProjects] = useState<Project[]>([]);
   const [locations, setLocations] = useState<RoadLocation[]>([]);
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [videos, setVideos] = useState<VideoRecord[]>([]);
+  const [videoAnalyses, setVideoAnalyses] = useState<VideoAnalysisRecord[]>([]);
   const [processingJobs, setProcessingJobs] = useState<ProcessingJob[]>([]);
   const [conflictEvents, setConflictEvents] = useState<ConflictEvent[]>([]);
   const [fingerprintStatuses, setFingerprintStatuses] = useState<
@@ -332,12 +342,20 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           const next: ServerHealthStatus = {
             maxUploadMb: data.maxUploadMb ?? 250,
             cvAdapter: {
-              status: data.cvAdapter.status || (data.cvAdapter.externalWorkerConfigured ? 'available' : 'not_configured'),
+              status: data.cvAdapter.status || (data.geminiConfigured ? 'available' : 'not_configured'),
               mode: data.cvAdapter.mode || 'UNAVAILABLE',
               externalWorkerConfigured: Boolean(data.cvAdapter.externalWorkerConfigured),
               workerReachable: Boolean(data.cvAdapter.workerReachable),
               rtspIngestionReady: Boolean(data.cvAdapter.rtspIngestionReady),
               modelVersion: data.cvAdapter.modelVersion ?? null,
+              tracker: data.cvAdapter.tracker ?? null,
+              device: data.cvAdapter.device ?? null,
+              sampleFps: typeof data.cvAdapter.sampleFps === 'number' ? data.cvAdapter.sampleFps : null,
+              classes: Array.isArray(data.cvAdapter.classes) ? data.cvAdapter.classes : null,
+              asyncJobsSupported: Boolean(data.cvAdapter.asyncJobsSupported),
+              supportedFormats: Array.isArray(data.cvAdapter.supportedFormats)
+                ? data.cvAdapter.supportedFormats
+                : null,
               latencyMs: data.cvAdapter.latencyMs ?? null,
               message: data.cvAdapter.message,
               checkedAt: data.cvAdapter.checkedAt,
@@ -472,8 +490,12 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
     auditLogs,
   ]);
 
-  // Re-attach precomputed detections for demonstration clips restored from compact cache
+  // Re-attach precomputed detections for demo clips AND hydrate persisted Firestore videoAnalyses onto uploaded videos
   const hydratedVideos = useMemo(() => {
+    const analysisByVideoId = new Map<string, VideoAnalysisRecord>();
+    for (const analysis of videoAnalyses) {
+      analysisByVideoId.set(analysis.videoId || analysis.id, analysis);
+    }
     return videos.map((v) => {
       if (v.isDemonstration && (!v.detections || v.detections.length === 0)) {
         const orig = DEMO_VIDEOS.find((dv) => dv.id === v.id);
@@ -481,9 +503,23 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           return { ...v, detections: orig.detections, trajectories: orig.trajectories };
         }
       }
+      const saved = analysisByVideoId.get(v.id);
+      if (saved) {
+        return {
+          ...v,
+          geminiAnalysis: v.geminiAnalysis ?? saved.geminiAnalysis,
+          detectionsSummary: v.detectionsSummary ?? saved.detectionsSummary,
+          tracks: v.tracks && v.tracks.length > 0 ? v.tracks : saved.tracks,
+          detections: v.detections && v.detections.length > 0 ? v.detections : saved.detections,
+          trajectories:
+            v.trajectories && v.trajectories.length > 0 ? v.trajectories : saved.trajectories,
+          conflicts: v.conflicts && v.conflicts.length > 0 ? v.conflicts : saved.conflicts,
+          thresholds: v.thresholds ?? saved.thresholds,
+        };
+      }
       return v;
     });
-  }, [videos]);
+  }, [videos, videoAnalyses]);
 
   // Keep selectedProjectId valid if the selected project was deleted
   useEffect(() => {
@@ -519,6 +555,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
       setLocations([]);
       setCameras([]);
       setVideos([]);
+      setVideoAnalyses([]);
       setProcessingJobs([]);
       setConflictEvents([]);
       setRecommendations([]);
@@ -676,6 +713,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
     bindOwnerCollection<RoadLocation>('locations', setLocations);
     bindOwnerCollection<Camera>('cameras', setCameras);
     bindOwnerCollection<VideoRecord>('videos', setVideos);
+    bindOwnerCollection<VideoAnalysisRecord>('videoAnalyses', setVideoAnalyses);
     bindOwnerCollection<ProcessingJob>('processingJobs', setProcessingJobs);
     // Normalize optional event fields on Firestore load
     unsubs.push(
@@ -1123,6 +1161,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         setLocations((prev) => prev.filter((l) => l.projectId !== id));
         setCameras((prev) => prev.filter((c) => c.projectId !== id));
         setVideos((prev) => prev.filter((v) => v.projectId !== id));
+        setVideoAnalyses((prev) => prev.filter((a) => a.projectId !== id));
         setProcessingJobs((prev) => prev.filter((j) => j.projectId !== id));
         setConflictEvents((prev) => prev.filter((e) => e.projectId !== id));
         setRecommendations((prev) => prev.filter((r) => r.projectId !== id));
@@ -1139,6 +1178,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           }
           for (const v of videos.filter((item) => item.projectId === id)) {
             batch.delete(doc(db, 'videos', v.id));
+            batch.delete(doc(db, 'videoAnalyses', v.id));
           }
           for (const j of processingJobs.filter((item) => item.projectId === id)) {
             batch.delete(doc(db, 'processingJobs', j.id));
@@ -1371,10 +1411,12 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
 
       const notifMessage =
         job.status === 'Failed'
-          ? job.errorMessage || 'CV analysis could not run. The uploaded video remains safely stored in your project.'
+          ? job.errorMessage || 'AI video analysis could not complete. The uploaded video remains safely stored in your project.'
           : job.status === 'Cancelled'
             ? 'Analysis job was cancelled. The uploaded video remains saved in your project.'
-            : `${events.length} potential conflict event(s) identified via ${job.modelVersion}.`;
+            : video.geminiAnalysis
+              ? `${video.geminiAnalysis.events.length} timeline observation(s) and ${events.length} safety conflict(s) identified via ${job.modelVersion}.`
+              : `${events.length} potential conflict event(s) identified via ${job.modelVersion}.`;
 
       const notif: AppNotification = {
         id: sanitizeFirestoreId(`notif_${Date.now()}`),
@@ -1410,7 +1452,10 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           'Uploading',
           'Uploaded',
           'Queued',
+          'Analyzing',
           'Processing',
+          'AI Analysis',
+          'Saving Results',
           'Completed',
           'Failed',
           'Cancelled',
@@ -1508,22 +1553,26 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         const safeJobId = sanitizeFirestoreId(job.id);
         const allowedJobStatuses: Array<ProcessingJob['status']> = [
           'Queued',
+          'Analyzing',
           'Processing',
+          'AI Analysis',
+          'Saving Results',
           'Completed',
           'Failed',
           'Cancelled',
         ];
         const safeJobStatus = allowedJobStatuses.includes(job.status) ? job.status : 'Failed';
         const allowedEngineModes: Array<ProcessingJob['engineMode']> = [
+          'GEMINI_AI',
           'CV_SERVICE',
           'DEVELOPMENT_FALLBACK',
           'DEMONSTRATION',
         ];
         const safeEngineMode = allowedEngineModes.includes(job.engineMode)
           ? job.engineMode
-          : 'CV_SERVICE';
-        const rawModelVer = (job.modelVersion || 'CV Worker').trim();
-        const safeModelVer = (rawModelVer.length >= 2 ? rawModelVer : 'CV Worker').slice(0, 120);
+          : 'GEMINI_AI';
+        const rawModelVer = (job.modelVersion || 'gemini-4-hydrogen').trim();
+        const safeModelVer = (rawModelVer.length >= 2 ? rawModelVer : 'gemini-4-hydrogen').slice(0, 120);
         const safeWarnings = Array.isArray(job.warnings)
           ? job.warnings
               .filter((w): w is string => typeof w === 'string' && w.length > 0)
@@ -1539,6 +1588,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
             progress: Number.isFinite(job.progress)
               ? Math.min(100, Math.max(0, Number(job.progress)))
               : 0,
+            ...(job.stageMessage ? { stageMessage: job.stageMessage.slice(0, 300) } : {}),
             engineMode: safeEngineMode,
             modelVersion: safeModelVer,
             analyzedFrames: Number.isFinite(job.analyzedFrames)
@@ -1566,8 +1616,120 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           throw err;
         }
 
+        // Persist real tracks, detections, detectionsSummary, conflicts, and thresholds under videoAnalyses/{videoId}
+        if (safeJobStatus === 'Completed') {
+          const downsample = <T,>(arr: T[], maxItems: number): T[] => {
+            if (arr.length <= maxItems) return arr;
+            const stride = Math.ceil(arr.length / maxItems);
+            return arr.filter((_, idx) => idx % stride === 0).slice(0, maxItems);
+          };
+
+          const boundedTracks = (video.tracks || []).slice(0, 150).map((tr) => ({
+            id: String(tr.id),
+            class: String(tr.class),
+            avg_confidence: Number(tr.avg_confidence ?? 0),
+            speed_px_per_s:
+              typeof tr.speed_px_per_s === 'number' && Number.isFinite(tr.speed_px_per_s)
+                ? tr.speed_px_per_s
+                : null,
+            ...(tr.direction_label ? { direction_label: String(tr.direction_label).slice(0, 80) } : {}),
+            trajectory: downsample(Array.isArray(tr.trajectory) ? tr.trajectory : [], 60),
+          }));
+
+          const boundedDetections = downsample(video.detections || [], 600);
+          const boundedTrajectories = (video.trajectories || []).slice(0, 150).map((t) => ({
+            ...t,
+            positions: downsample(Array.isArray(t.positions) ? t.positions : [], 60),
+          }));
+          const boundedConflicts = (video.conflicts || []).slice(0, 100);
+          const detectionsSummary = video.detectionsSummary || {
+            total_detections: boundedDetections.length,
+            by_class: {},
+          };
+          const videoMetadata =
+            safeWidth && safeHeight
+              ? {
+                  fps: safeFps ?? 0,
+                  width: safeWidth,
+                  height: safeHeight,
+                  resolution: `${safeWidth}x${safeHeight}`,
+                  duration: safeDuration,
+                }
+              : undefined;
+
+          const analysisRef = doc(db, 'videoAnalyses', safeVideoId);
+          const safeGeminiAnalysis = video.geminiAnalysis
+            ? {
+                video_summary: String(video.geminiAnalysis.video_summary || '').slice(0, 1950),
+                duration_seconds: Number.isFinite(video.geminiAnalysis.duration_seconds)
+                  ? Math.max(0, Math.min(86400, Number(video.geminiAnalysis.duration_seconds)))
+                  : safeDuration,
+                events: Array.isArray(video.geminiAnalysis.events)
+                  ? video.geminiAnalysis.events.slice(0, 60)
+                  : [],
+                detected_objects: Array.isArray(video.geminiAnalysis.detected_objects)
+                  ? video.geminiAnalysis.detected_objects.slice(0, 40)
+                  : [],
+                important_moments: Array.isArray(video.geminiAnalysis.important_moments)
+                  ? video.geminiAnalysis.important_moments.slice(0, 40)
+                  : [],
+                safety_observations: Array.isArray(video.geminiAnalysis.safety_observations)
+                  ? video.geminiAnalysis.safety_observations.slice(0, 30)
+                  : [],
+                overall_assessment: String(video.geminiAnalysis.overall_assessment || '').slice(0, 1950),
+                model_version: String(video.geminiAnalysis.model_version || safeModelVer).slice(0, 120),
+                analyzed_at: String(video.geminiAnalysis.analyzed_at || new Date().toISOString()).slice(0, 64),
+              }
+            : undefined;
+          try {
+            const existingSnap = await getDoc(analysisRef);
+            if (existingSnap.exists()) {
+              await updateDoc(analysisRef, {
+                jobId: safeJobId,
+                modelVersion: safeModelVer,
+                engineMode: safeEngineMode,
+                ...(videoMetadata ? { videoMetadata } : {}),
+                detectionsSummary,
+                ...(safeGeminiAnalysis ? { geminiAnalysis: safeGeminiAnalysis } : {}),
+                tracks: boundedTracks,
+                detections: boundedDetections,
+                trajectories: boundedTrajectories,
+                conflicts: boundedConflicts,
+                ...(video.thresholds ? { thresholds: video.thresholds } : {}),
+                updatedAt: serverTimestamp(),
+              });
+            } else {
+              await setDoc(analysisRef, {
+                videoId: safeVideoId,
+                projectId: safeProjectId,
+                ownerId: safeOwnerId,
+                jobId: safeJobId,
+                modelVersion: safeModelVer,
+                engineMode: safeEngineMode,
+                ...(videoMetadata ? { videoMetadata } : {}),
+                detectionsSummary,
+                ...(safeGeminiAnalysis ? { geminiAnalysis: safeGeminiAnalysis } : {}),
+                tracks: boundedTracks,
+                detections: boundedDetections,
+                trajectories: boundedTrajectories,
+                conflicts: boundedConflicts,
+                ...(video.thresholds ? { thresholds: video.thresholds } : {}),
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+            }
+          } catch (err) {
+            handleFirestoreError(err, OperationType.WRITE, `videoAnalyses/${safeVideoId}`);
+            throw err;
+          }
+        }
+
         for (const ev of events) {
           const safeEventId = sanitizeFirestoreId(ev.id);
+          const validSeverity =
+            ev.severity === 'low' || ev.severity === 'medium' || ev.severity === 'high'
+              ? ev.severity
+              : undefined;
           try {
             await setDoc(doc(db, 'conflictEvents', safeEventId), {
               videoId: safeVideoId,
@@ -1579,6 +1741,9 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
               occurredAt: (ev.occurredAt || new Date().toISOString()).slice(0, 64),
               conflictType: ev.conflictType,
               originalConflictType: ev.originalConflictType,
+              ...(validSeverity ? { severity: validSeverity } : {}),
+              ...(ev.locationXy !== undefined ? { locationXy: ev.locationXy } : {}),
+              ...(ev.detectionMethod ? { detectionMethod: ev.detectionMethod.slice(0, 80) } : {}),
               riskScore: Number.isFinite(ev.riskScore)
                 ? Math.min(100, Math.max(0, Number(ev.riskScore)))
                 : 0,
@@ -1646,12 +1811,14 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
 
       if (isDemoMode) {
         setVideos((prev) => prev.filter((v) => v.id !== videoId));
+        setVideoAnalyses((prev) => prev.filter((a) => a.videoId !== videoId && a.id !== videoId));
         setProcessingJobs((prev) => prev.filter((j) => j.videoId !== videoId));
         setConflictEvents((prev) => prev.filter((e) => e.videoId !== videoId));
       } else if (firebaseUser?.emailVerified) {
         try {
           const batch = writeBatch(db);
           batch.delete(doc(db, 'videos', videoId));
+          batch.delete(doc(db, 'videoAnalyses', videoId));
           for (const j of processingJobs.filter((item) => item.videoId === videoId)) {
             batch.delete(doc(db, 'processingJobs', j.id));
           }
@@ -1671,9 +1838,19 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
     [videos, processingJobs, conflictEvents, isDemoMode, currentUser?.role, firebaseUser, recordAudit, pushToast]
   );
 
-  // --- Retry CV Analysis on an Existing Uploaded Video Without Re-Uploading ---
+  // --- Retry Gemini AI Analysis on an Existing Uploaded Video Without Re-Uploading ---
   const retryVideoAnalysis = useCallback(
-    async (videoId: string): Promise<{ ok: boolean; status: string; error?: string }> => {
+    async (
+      videoId: string,
+      onProgress?: (job: ProcessingJob) => void
+    ): Promise<{ ok: boolean; status: string; error?: string; job?: ProcessingJob }> => {
+      if (retryingVideoIdsRef.current.has(videoId)) {
+        return {
+          ok: false,
+          status: 'Processing',
+          error: 'An AI analysis job is already running for this video.',
+        };
+      }
       const target = videos.find((v) => v.id === videoId);
       if (!target || !currentUser) {
         return { ok: false, status: 'Failed', error: 'Video record not found.' };
@@ -1686,6 +1863,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         };
       }
 
+      retryingVideoIdsRef.current.add(videoId);
       try {
         const res = await roadshadowFetch('/api/processing/jobs', {
           method: 'POST',
@@ -1703,15 +1881,16 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         });
         const data = await res.json();
         if (!res.ok) {
-          const msg = data.error || 'Could not start analysis job.';
+          const msg = data.error || 'Could not start AI analysis job.';
           pushToast({ type: 'error', title: 'Retry Failed', description: msg });
           return { ok: false, status: 'Failed', error: msg };
         }
 
         const jobId = data.job.id as string;
         let finalJob = data.job;
-        for (let attempt = 0; attempt < 180; attempt += 1) {
-          await new Promise((r) => setTimeout(r, 1000));
+        onProgress?.(finalJob);
+        for (let attempt = 0; attempt < 240; attempt += 1) {
+          await new Promise((r) => setTimeout(r, 900));
           const poll = await roadshadowFetch(`/api/processing/jobs/${jobId}`, {
             isDemoMode,
             demoRole: currentUser.role,
@@ -1719,6 +1898,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           if (!poll.ok) continue;
           const polled = await poll.json();
           finalJob = polled.job;
+          onProgress?.(finalJob);
           if (
             finalJob.status === 'Completed' ||
             finalJob.status === 'Failed' ||
@@ -1729,12 +1909,22 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         }
 
         const nowIso = new Date().toISOString();
+        const rp = finalJob.resultPayload;
         const updatedVideo: VideoRecord = {
           ...target,
           status: finalJob.status,
-          errorMessage: finalJob.errorMessage,
-          detections: finalJob.resultPayload?.detections ?? target.detections,
-          trajectories: finalJob.resultPayload?.trajectories ?? target.trajectories,
+          errorMessage: finalJob.status === 'Completed' ? undefined : finalJob.errorMessage,
+          ...(rp?.videoMetadata?.width ? { width: rp.videoMetadata.width } : {}),
+          ...(rp?.videoMetadata?.height ? { height: rp.videoMetadata.height } : {}),
+          ...(rp?.videoMetadata?.fps ? { fps: rp.videoMetadata.fps } : {}),
+          ...(rp?.videoMetadata?.duration ? { durationSec: rp.videoMetadata.duration } : {}),
+          geminiAnalysis: rp?.geminiAnalysis ?? target.geminiAnalysis,
+          detectionsSummary: rp?.detectionsSummary ?? target.detectionsSummary,
+          tracks: rp?.tracks ?? target.tracks,
+          conflicts: rp?.conflicts ?? target.conflicts,
+          thresholds: rp?.thresholds ?? target.thresholds,
+          detections: rp?.detections ?? target.detections,
+          trajectories: rp?.trajectories ?? target.trajectories,
           updatedAt: nowIso,
         };
         const jobRecord: ProcessingJob = {
@@ -1744,8 +1934,9 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           ownerId: currentUser.uid,
           status: finalJob.status,
           progress: finalJob.progress ?? 0,
-          engineMode: finalJob.engineMode || 'CV_SERVICE',
-          modelVersion: finalJob.modelVersion || 'CV Worker',
+          stageMessage: finalJob.stageMessage,
+          engineMode: finalJob.engineMode || 'GEMINI_AI',
+          modelVersion: finalJob.modelVersion || 'gemini-4-hydrogen',
           analyzedFrames: finalJob.analyzedFrames || 0,
           processingTimeMs: finalJob.processingTimeMs || 0,
           detectedObjectCount: finalJob.detectedObjectCount || 0,
@@ -1767,21 +1958,23 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         if (finalJob.status === 'Completed') {
           pushToast({
             type: 'success',
-            title: 'Analysis Completed',
-            description: `${finalJob.conflictCount || 0} conflict event(s) detected.`,
+            title: 'AI Video Analysis Completed',
+            description: `${rp?.geminiAnalysis?.events?.length ?? 0} timeline observation(s) and ${finalJob.conflictCount || 0} safety event(s) saved.`,
           });
-          return { ok: true, status: 'Completed' };
+          return { ok: true, status: 'Completed', job: jobRecord };
         }
         pushToast({
           type: 'warning',
-          title: 'CV Analysis Unavailable',
-          description: finalJob.errorMessage || 'External CV worker could not process this video.',
+          title: 'AI Analysis Failed',
+          description: finalJob.errorMessage || 'Gemini AI video analysis could not complete.',
         });
-        return { ok: false, status: finalJob.status, error: finalJob.errorMessage };
+        return { ok: false, status: finalJob.status, error: finalJob.errorMessage, job: jobRecord };
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Retry request failed.';
         pushToast({ type: 'error', title: 'Retry Error', description: msg });
         return { ok: false, status: 'Failed', error: msg };
+      } finally {
+        retryingVideoIdsRef.current.delete(videoId);
       }
     },
     [videos, currentUser, isDemoMode, registerUploadedVideoAndResults, pushToast]

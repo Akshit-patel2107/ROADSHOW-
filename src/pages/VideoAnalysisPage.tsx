@@ -2,22 +2,27 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
+  CheckCircle2,
+  Clock,
   Eye,
   EyeOff,
   GitBranch,
+  Info,
   Loader2,
   Maximize2,
   Pause,
   Play,
   RefreshCw,
   RotateCcw,
+  ShieldAlert,
   SkipBack,
+  Sparkles,
   Upload,
 } from 'lucide-react';
 import { useRoadshadow } from '../context/RoadshadowContext';
 import { RiskIndicator } from '../components/RiskBadge';
 import { canPerformAction } from '../engine/validation';
-import type { DetectedObjectClass } from '../types/roadshadow';
+import type { DetectedObjectClass, GeminiRiskLevel } from '../types/roadshadow';
 
 const CLASS_STYLE: Record<DetectedObjectClass, { stroke: string; label: string }> = {
   person: { stroke: '#E5484D', label: 'Person' },
@@ -30,6 +35,15 @@ const CLASS_STYLE: Record<DetectedObjectClass, { stroke: string; label: string }
   truck: { stroke: '#38BDF8', label: 'Truck' },
   other_vehicle: { stroke: '#CBD5E1', label: 'Vehicle' },
 };
+
+const CORE_CV_CLASSES: DetectedObjectClass[] = [
+  'car',
+  'motorcycle',
+  'bus',
+  'truck',
+  'bicycle',
+  'person',
+];
 
 export function VideoAnalysisPage() {
   const { videoId } = useParams();
@@ -77,6 +91,67 @@ export function VideoAnalysisPage() {
     [selectedVideo, conflictEvents]
   );
 
+  // Real detection counts by class (derived strictly from CV worker summary or actual detections; never fabricated)
+  const detectionsByClass = useMemo(() => {
+    const counts: Record<string, number> = {
+      car: 0,
+      motorcycle: 0,
+      bus: 0,
+      truck: 0,
+      bicycle: 0,
+      person: 0,
+    };
+    if (selectedVideo?.detectionsSummary?.by_class) {
+      for (const [cls, val] of Object.entries(selectedVideo.detectionsSummary.by_class)) {
+        counts[cls] = Number(val || 0);
+      }
+      return counts;
+    }
+    for (const det of selectedVideo?.detections ?? []) {
+      counts[det.objectClass] = (counts[det.objectClass] || 0) + 1;
+    }
+    return counts;
+  }, [selectedVideo?.detectionsSummary, selectedVideo?.detections]);
+
+  // Real tracked road-user rows (prefers FastAPI tracks[] with exact speed_px_per_s, falls back to real trajectories[])
+  const trackedRoadUsers = useMemo(() => {
+    if (selectedVideo?.tracks && selectedVideo.tracks.length > 0) {
+      return selectedVideo.tracks.map((tr) => {
+        const pts = tr.trajectory || [];
+        const firstT = pts.length > 0 ? pts[0].t : 0;
+        const lastT = pts.length > 0 ? pts[pts.length - 1].t : 0;
+        return {
+          id: tr.id,
+          objectClass: tr.class,
+          avgConfidence: tr.avg_confidence,
+          speedPxPerSec: tr.speed_px_per_s,
+          pointsCount: pts.length,
+          firstTimeSec: firstT,
+          lastTimeSec: lastT,
+          directionLabel: tr.direction_label || 'Tracked path',
+        };
+      });
+    }
+    if (selectedVideo?.trajectories && selectedVideo.trajectories.length > 0) {
+      return selectedVideo.trajectories.map((traj) => {
+        const pts = traj.positions || [];
+        const firstT = pts.length > 0 ? pts[0].timestampSec : 0;
+        const lastT = pts.length > 0 ? pts[pts.length - 1].timestampSec : 0;
+        return {
+          id: traj.trackingId,
+          objectClass: traj.objectClass,
+          avgConfidence: traj.trackingConfidence,
+          speedPxPerSec: null as number | null,
+          pointsCount: pts.length,
+          firstTimeSec: firstT,
+          lastTimeSec: lastT,
+          directionLabel: traj.directionLabel,
+        };
+      });
+    }
+    return [];
+  }, [selectedVideo?.tracks, selectedVideo?.trajectories]);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
@@ -84,6 +159,7 @@ export function VideoAnalysisPage() {
   const [showTrajectories, setShowTrajectories] = useState(true);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [liveRetryStage, setLiveRetryStage] = useState<string | null>(null);
 
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
@@ -316,6 +392,34 @@ export function VideoAnalysisPage() {
   }
 
   const location = locations.find((l) => l.id === selectedVideo.locationId);
+  const geminiAnalysis = selectedVideo.geminiAnalysis ?? null;
+
+  const getGeminiRiskStyle = (level: GeminiRiskLevel) => {
+    switch (level) {
+      case 'high':
+        return 'bg-[#E5484D]/15 text-[#F87171] border-[#E5484D]/40';
+      case 'medium':
+        return 'bg-[#F97316]/15 text-[#FB923C] border-[#F97316]/40';
+      case 'low':
+        return 'bg-[#EAB308]/15 text-[#FACC15] border-[#EAB308]/40';
+      default:
+        return 'bg-[#22C55E]/15 text-[#4ADE80] border-[#22C55E]/40';
+    }
+  };
+
+  const handleRunAiAnalysis = async () => {
+    if (!selectedVideo || retrying) return;
+    setRetrying(true);
+    setLiveRetryStage('Submitting video to Gemini AI pipeline...');
+    try {
+      await retryVideoAnalysis(selectedVideo.id, (jobUpdate) => {
+        setLiveRetryStage(jobUpdate.stageMessage || `${jobUpdate.status} (${jobUpdate.progressPercent}%)`);
+      });
+    } finally {
+      setRetrying(false);
+      setLiveRetryStage(null);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -338,15 +442,31 @@ export function VideoAnalysisPage() {
               {selectedVideo.isDemonstration
                 ? 'Demonstration Precomputed Output'
                 : selectedVideo.status === 'Failed'
-                  ? 'Stored Video · CV Analysis Pending/Failed'
-                  : relatedJob?.engineMode === 'CV_SERVICE'
-                    ? 'Real CV Worker Output'
+                  ? 'Stored Video · AI Analysis Failed'
+                  : geminiAnalysis || relatedJob?.engineMode === 'GEMINI_AI'
+                    ? `Gemini AI Video Analysis (${geminiAnalysis?.model_version || relatedJob?.modelVersion || 'gemini-4-hydrogen'})`
                     : 'Stored Video'}
             </span>
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {!selectedVideo.isDemonstration && selectedVideo.status === 'Completed' && canRetry && (
+            <button
+              type="button"
+              disabled={retrying}
+              onClick={handleRunAiAnalysis}
+              data-testid="rerun-ai-analysis-btn"
+              className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#122943] hover:bg-[#173252] border border-[#233B56] disabled:opacity-50 text-[#F5F8FC] text-xs font-medium rounded-md whitespace-nowrap"
+            >
+              {retrying ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#45B5FF]" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5 text-[#45B5FF]" />
+              )}
+              {retrying ? 'Re-analysing...' : 'Re-run AI Analysis'}
+            </button>
+          )}
           <label htmlFor="video-selector" className="sr-only">
             Select analysed video
           </label>
@@ -358,30 +478,43 @@ export function VideoAnalysisPage() {
           >
             {availableVideos.map((v) => (
               <option key={v.id} value={v.id}>
-                {v.title} {v.isDemonstration ? '(Demo)' : v.status === 'Failed' ? '(CV Pending)' : ''}
+                {v.title} {v.isDemonstration ? '(Demo)' : v.status === 'Failed' ? '(AI Failed)' : ''}
               </option>
             ))}
           </select>
         </div>
       </div>
 
-      {/* Honest CV Unavailable / Retry Banner for stored non-demo videos that failed CV analysis */}
+      {/* Live Retry Progress Banner */}
+      {retrying && liveRetryStage && (
+        <div
+          role="status"
+          className="p-3.5 rounded-lg bg-[#0D1F35] border border-[#2585FF]/50 flex items-center gap-2.5 text-xs text-[#F5F8FC]"
+        >
+          <Loader2 className="w-4 h-4 animate-spin text-[#45B5FF] shrink-0" />
+          <span>
+            <strong className="text-[#45B5FF]">Gemini AI Analysis Running:</strong> {liveRetryStage}
+          </span>
+        </div>
+      )}
+
+      {/* Honest Failure / Retry Banner for stored non-demo videos that failed AI analysis */}
       {!selectedVideo.isDemonstration && selectedVideo.status === 'Failed' && (
         <div
           role="status"
-          data-testid="video-cv-unavailable-banner"
+          data-testid="video-ai-failed-banner"
           className="p-4 rounded-lg bg-[#122943] border border-[#EAB308]/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
         >
           <div className="flex items-start gap-2.5 text-xs text-[#A9B8CA]">
             <AlertTriangle className="w-4 h-4 text-[#EAB308] shrink-0 mt-0.5" />
             <div>
               <p className="text-sm font-semibold text-[#F5F8FC]">
-                Uploaded Video Stored — Automated CV Analysis Unavailable
+                Uploaded Video Stored — Gemini AI Analysis Did Not Complete
               </p>
               <p className="mt-0.5 leading-relaxed">
                 {selectedVideo.errorMessage ||
                   relatedJob?.errorMessage ||
-                  'External CV service (CV_SERVICE_URL) was not connected when this video was submitted. No synthetic bounding boxes or conflict events were fabricated.'}
+                  'Gemini multimodal analysis did not complete when this video was submitted. No synthetic events or detections were fabricated.'}
               </p>
             </div>
           </div>
@@ -389,14 +522,8 @@ export function VideoAnalysisPage() {
             <button
               type="button"
               disabled={retrying}
-              onClick={async () => {
-                setRetrying(true);
-                try {
-                  await retryVideoAnalysis(selectedVideo.id);
-                } finally {
-                  setRetrying(false);
-                }
-              }}
+              onClick={handleRunAiAnalysis}
+              data-testid="retry-ai-analysis-btn"
               className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#2585FF] hover:bg-[#1C74E8] disabled:opacity-50 text-white text-xs font-medium rounded-md whitespace-nowrap shrink-0"
             >
               {retrying ? (
@@ -404,7 +531,7 @@ export function VideoAnalysisPage() {
               ) : (
                 <RefreshCw className="w-3.5 h-3.5" />
               )}
-              Retry CV Analysis
+              {retrying ? 'Analysing...' : 'Retry AI Analysis'}
             </button>
           )}
         </div>
@@ -557,6 +684,216 @@ export function VideoAnalysisPage() {
             </div>
           </div>
 
+          {/* Structured Gemini AI Video Intelligence Results */}
+          {geminiAnalysis && (
+            <section
+              data-testid="gemini-video-intelligence-panel"
+              className="bg-[#122943] border border-[#2585FF]/40 rounded-lg p-5 space-y-5"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#233B56] pb-4">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F5F8FC] flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-[#45B5FF]" />
+                    Gemini AI Video Intelligence
+                  </h2>
+                  <p className="text-xs text-[#A9B8CA] mt-0.5">
+                    Multimodal footage understanding from actual uploaded video · Click any timestamp to jump the player
+                  </p>
+                </div>
+                <div className="text-right text-[11px] font-mono text-[#A9B8CA]">
+                  <p className="text-[#45B5FF]">{geminiAnalysis.model_version}</p>
+                  <p>{new Date(geminiAnalysis.analyzed_at).toLocaleString()}</p>
+                </div>
+              </div>
+
+              {/* Summary & Overall Assessment */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-1.5">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-[#45B5FF]">
+                    Observed Video Summary
+                  </p>
+                  <p
+                    data-testid="gemini-video-summary"
+                    className="text-sm text-[#F5F8FC] leading-relaxed"
+                  >
+                    {geminiAnalysis.video_summary}
+                  </p>
+                </div>
+                <div className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-1.5">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-[#A9B8CA] flex items-center gap-1.5">
+                    <Info className="w-3.5 h-3.5 text-[#45B5FF]" />
+                    AI Safety Assessment (Provisional)
+                  </p>
+                  <p
+                    data-testid="gemini-overall-assessment"
+                    className="text-sm text-[#F5F8FC] leading-relaxed"
+                  >
+                    {geminiAnalysis.overall_assessment}
+                  </p>
+                </div>
+              </div>
+
+              {/* Detected Objects & Estimated Counts */}
+              <div className="space-y-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-[#A9B8CA]">
+                  Observed Objects &amp; Road Users ({geminiAnalysis.detected_objects.length})
+                </h3>
+                {geminiAnalysis.detected_objects.length === 0 ? (
+                  <p className="text-xs text-[#A9B8CA] p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+                    No distinct vehicles, pedestrians, or traffic objects were confidently identified in this footage.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                    {geminiAnalysis.detected_objects.map((obj, idx) => (
+                      <div
+                        key={`${obj.label}-${idx}`}
+                        className="p-3 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-1"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-[#F5F8FC] capitalize">
+                            {obj.label}
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-[#122943] border border-[#233B56] font-mono text-[11px] text-[#45B5FF]">
+                            ~{obj.count_estimate}
+                          </span>
+                        </div>
+                        {obj.notes && (
+                          <p className="text-[11px] text-[#A9B8CA] leading-relaxed">{obj.notes}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Timestamped AI Events Timeline */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-[#A9B8CA]">
+                  Timestamped Timeline Events ({geminiAnalysis.events.length})
+                </h3>
+                {geminiAnalysis.events.length === 0 ? (
+                  <p className="text-xs text-[#A9B8CA] p-3 rounded-md bg-[#0D1F35] border border-[#233B56]">
+                    No distinct traffic events or anomalous interactions were observed during this clip.
+                  </p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {geminiAnalysis.events.map((ev, idx) => (
+                      <div
+                        key={`${ev.timestamp_start}-${idx}`}
+                        className="p-3.5 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              replayStopAtRef.current = null;
+                              setCurrentTime(Math.max(0, Math.min(duration, ev.timestamp_start_sec)));
+                              setIsPlaying(false);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#122943] hover:bg-[#173252] border border-[#2585FF]/40 font-mono text-xs text-[#45B5FF]"
+                          >
+                            <Clock className="w-3.5 h-3.5" />
+                            {ev.timestamp_start} – {ev.timestamp_end}
+                            {ev.is_approximate && (
+                              <span className="text-[10px] text-[#A9B8CA]">(approx.)</span>
+                            )}
+                          </button>
+
+                          <div className="flex items-center gap-2 text-[11px] font-mono">
+                            <span className="px-2 py-0.5 rounded bg-[#122943] border border-[#233B56] text-[#A9B8CA]">
+                              conf: {ev.confidence}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 rounded border uppercase ${getGeminiRiskStyle(ev.risk_level)}`}
+                            >
+                              risk: {ev.risk_level}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div>
+                          <p className="text-sm font-semibold text-[#F5F8FC]">{ev.event}</p>
+                          <p className="text-xs text-[#A9B8CA] mt-0.5">{ev.activity}</p>
+                        </div>
+
+                        {ev.reason && (
+                          <p className="text-xs text-[#CBD5E1] leading-relaxed border-l-2 border-[#2585FF]/60 pl-2.5">
+                            {ev.reason}
+                          </p>
+                        )}
+
+                        {ev.objects_detected.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 pt-1">
+                            {ev.objects_detected.map((o, i) => (
+                              <span
+                                key={`${o}-${i}`}
+                                className="px-2 py-0.5 rounded bg-[#122943] border border-[#233B56] text-[11px] text-[#A9B8CA]"
+                              >
+                                {o}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Important Moments + Safety Observations */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                <div className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-[#A9B8CA]">
+                    Important Moments ({geminiAnalysis.important_moments.length})
+                  </h3>
+                  {geminiAnalysis.important_moments.length === 0 ? (
+                    <p className="text-xs text-[#A9B8CA]">No notable highlight moments flagged.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {geminiAnalysis.important_moments.map((m, idx) => (
+                        <li key={`${m.timestamp}-${idx}`} className="flex items-start gap-2 text-xs">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              replayStopAtRef.current = null;
+                              setCurrentTime(Math.max(0, Math.min(duration, m.timestamp_sec)));
+                              setIsPlaying(false);
+                            }}
+                            className="font-mono text-[#45B5FF] hover:underline shrink-0 mt-0.5"
+                          >
+                            @{m.timestamp}
+                          </button>
+                          <span className="text-[#F5F8FC] leading-relaxed">{m.description}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <div className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-[#A9B8CA] flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-[#EAB308]" />
+                    Safety Observations ({geminiAnalysis.safety_observations.length})
+                  </h3>
+                  {geminiAnalysis.safety_observations.length === 0 ? (
+                    <p className="text-xs text-[#A9B8CA] flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-[#22C55E] shrink-0" />
+                      No specific safety hazards flagged in this clip.
+                    </p>
+                  ) : (
+                    <ul className="space-y-1.5 text-xs text-[#F5F8FC] list-disc pl-4">
+                      {geminiAnalysis.safety_observations.map((obs, idx) => (
+                        <li key={idx} className="leading-relaxed">
+                          {obs}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+
           {/* 11.4 Analysis Summary Metrics */}
           <div className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-4">
             <h2 className="text-base font-semibold text-[#F5F8FC]">Analysis Summary</h2>
@@ -580,30 +917,76 @@ export function VideoAnalysisPage() {
                 </p>
               </div>
               <div>
-                <p className="text-[#A9B8CA]">Detections</p>
+                <p className="text-[#A9B8CA]">Observed Objects</p>
                 <p className="text-sm font-mono tabular-nums font-semibold text-[#F5F8FC] mt-1">
-                  {selectedVideo.detections?.length ?? relatedJob?.detectedObjectCount ?? 0}
+                  {selectedVideo.detectionsSummary?.total_detections ??
+                    selectedVideo.detections?.length ??
+                    relatedJob?.detectedObjectCount ??
+                    0}
                 </p>
               </div>
               <div>
-                <p className="text-[#A9B8CA]">Tracked IDs</p>
+                <p className="text-[#A9B8CA]">
+                  {geminiAnalysis && trackedRoadUsers.length === 0 ? 'AI Timeline Events' : 'Tracked IDs'}
+                </p>
                 <p className="text-sm font-mono tabular-nums font-semibold text-[#F5F8FC] mt-1">
-                  {selectedVideo.trajectories?.length ?? relatedJob?.trackingCount ?? 0}
+                  {geminiAnalysis && trackedRoadUsers.length === 0
+                    ? geminiAnalysis.events.length
+                    : selectedVideo.trajectories?.length ?? relatedJob?.trackingCount ?? 0}
                 </p>
               </div>
               <div>
-                <p className="text-[#A9B8CA]">Conflicts Found</p>
+                <p className="text-[#A9B8CA]">Safety Conflicts</p>
                 <p className="text-sm font-mono tabular-nums font-semibold text-[#F5F8FC] mt-1">
                   {relatedEvents.length}
                 </p>
               </div>
             </div>
 
-            <div className="pt-3 border-t border-[#233B56] text-xs text-[#A9B8CA] space-y-1">
-              <p>
-                <span className="text-[#F5F8FC] font-medium">Model / Engine:</span>{' '}
-                {relatedJob?.modelVersion || 'No processing job metadata'}
-              </p>
+            <div className="pt-3 border-t border-[#233B56] text-xs text-[#A9B8CA] space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p>
+                  <span className="text-[#F5F8FC] font-medium">Model / Engine:</span>{' '}
+                  {relatedJob?.modelVersion || 'No processing job metadata'}
+                </p>
+                {selectedVideo.width && selectedVideo.height && (
+                  <p className="font-mono text-[#A9B8CA]">
+                    {selectedVideo.width}×{selectedVideo.height}
+                    {selectedVideo.fps ? ` · ${selectedVideo.fps} FPS` : ''}
+                  </p>
+                )}
+              </div>
+
+              {/* Detections Summary by Class */}
+              <div data-testid="detections-by-class-grid" className="pt-2 border-t border-[#233B56]/70">
+                <p className="text-xs font-medium text-[#F5F8FC] mb-2">
+                  Detections by Road-User Class
+                </p>
+                <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                  {CORE_CV_CLASSES.map((cls) => {
+                    const style = CLASS_STYLE[cls];
+                    const count = detectionsByClass[cls] ?? 0;
+                    return (
+                      <div
+                        key={cls}
+                        className="p-2.5 rounded-md bg-[#0D1F35] border border-[#233B56] flex items-center justify-between gap-1.5"
+                      >
+                        <span className="flex items-center gap-1.5 text-[11px] text-[#A9B8CA] truncate">
+                          <span
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ backgroundColor: style.stroke }}
+                          />
+                          {style.label}
+                        </span>
+                        <span className="font-mono tabular-nums font-semibold text-[#F5F8FC]">
+                          {count}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               {relatedJob?.warnings && relatedJob.warnings.length > 0 && (
                 <div className="mt-2 p-3 rounded-md bg-[#0D1F35] border border-[#EAB308]/35 space-y-1">
                   <p className="text-[#EAB308] font-medium flex items-center gap-1.5">
@@ -618,6 +1001,90 @@ export function VideoAnalysisPage() {
                 </div>
               )}
             </div>
+          </div>
+
+          {/* Tracked Road Users Table */}
+          <div
+            data-testid="tracked-road-users-table"
+            className="bg-[#122943] border border-[#233B56] rounded-lg overflow-hidden"
+          >
+            <div className="p-4 border-b border-[#233B56] flex items-center justify-between gap-2">
+              <div>
+                <h2 className="text-base font-semibold text-[#F5F8FC]">
+                  Tracked Road Users ({trackedRoadUsers.length})
+                </h2>
+                <p className="text-xs text-[#A9B8CA]">
+                  {geminiAnalysis && trackedRoadUsers.length === 0
+                    ? 'Per-frame pixel-space bounding-box tracks are not generated by Gemini multimodal video analysis (see Observed Objects & Timestamped Timeline above).'
+                    : 'Object tracks with average confidence and pixel-space speed (click a row to jump to its first frame)'}
+                </p>
+              </div>
+            </div>
+            {trackedRoadUsers.length === 0 ? (
+              <div className="p-5 text-xs text-[#A9B8CA]">
+                {geminiAnalysis
+                  ? 'Gemini AI video analysis provides scene-level summaries, estimated object counts, safety observations, and timestamped events rather than per-frame pixel trajectories.'
+                  : 'No tracked road users stored for this video yet.'}
+              </div>
+            ) : (
+              <div className="overflow-x-auto max-h-64 overflow-y-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead className="sticky top-0 bg-[#0D1F35] border-b border-[#233B56] text-[#A9B8CA]">
+                    <tr>
+                      <th className="py-2 px-4 font-medium">Track ID</th>
+                      <th className="py-2 px-4 font-medium">Class</th>
+                      <th className="py-2 px-4 font-medium text-right">Avg Conf</th>
+                      <th className="py-2 px-4 font-medium text-right">Speed (px/s)</th>
+                      <th className="py-2 px-4 font-medium text-right">Time Span</th>
+                      <th className="py-2 px-4 font-medium">Movement</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#233B56]">
+                    {trackedRoadUsers.slice(0, 50).map((tr) => {
+                      const style =
+                        CLASS_STYLE[tr.objectClass as DetectedObjectClass] ||
+                        CLASS_STYLE.other_vehicle;
+                      return (
+                        <tr
+                          key={tr.id}
+                          onClick={() => {
+                            replayStopAtRef.current = null;
+                            setCurrentTime(Math.max(0, Math.min(duration, tr.firstTimeSec)));
+                            setIsPlaying(false);
+                          }}
+                          className="hover:bg-[#0D1F35]/70 cursor-pointer transition-colors"
+                        >
+                          <td className="py-2 px-4 font-mono text-[#45B5FF] whitespace-nowrap">
+                            {tr.id}
+                          </td>
+                          <td className="py-2 px-4 whitespace-nowrap">
+                            <span className="inline-flex items-center gap-1.5 text-[#F5F8FC]">
+                              <span
+                                className="w-2 h-2 rounded-full"
+                                style={{ backgroundColor: style.stroke }}
+                              />
+                              {style.label}
+                            </span>
+                          </td>
+                          <td className="py-2 px-4 text-right font-mono tabular-nums text-[#F5F8FC]">
+                            {Math.round(tr.avgConfidence * 100)}%
+                          </td>
+                          <td className="py-2 px-4 text-right font-mono tabular-nums text-[#F5F8FC]">
+                            {tr.speedPxPerSec !== null ? `${tr.speedPxPerSec.toFixed(1)}` : 'N/A'}
+                          </td>
+                          <td className="py-2 px-4 text-right font-mono tabular-nums text-[#A9B8CA] whitespace-nowrap">
+                            {tr.firstTimeSec.toFixed(1)}s – {tr.lastTimeSec.toFixed(1)}s ({tr.pointsCount} pts)
+                          </td>
+                          <td className="py-2 px-4 text-[#A9B8CA] truncate max-w-[160px]">
+                            {tr.directionLabel}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
 
@@ -741,7 +1208,27 @@ export function VideoAnalysisPage() {
                       : 'N/A'}
                   </span>
                 </div>
-                <div className="col-span-2">
+                <div>
+                  <span className="text-[#A9B8CA]">Severity Band:</span>{' '}
+                  <span className="font-mono uppercase text-[#F5F8FC]">
+                    {activeEvent.severity || activeEvent.riskCategory.toLowerCase()}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[#A9B8CA]">Detection Method:</span>{' '}
+                  <span className="font-mono text-[#F5F8FC]">
+                    {activeEvent.detectionMethod || 'ttc_proximity'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[#A9B8CA]">Location (x, y):</span>{' '}
+                  <span className="font-mono text-[#F5F8FC]">
+                    {activeEvent.locationXy && activeEvent.locationXy.length === 2
+                      ? `(${Math.round(activeEvent.locationXy[0])}, ${Math.round(activeEvent.locationXy[1])})`
+                      : 'N/A'}
+                  </span>
+                </div>
+                <div>
                   <span className="text-[#A9B8CA]">Trajectory Convergence:</span>{' '}
                   <span className="font-mono text-[#F5F8FC]">
                     {activeEvent.trajectoryConvergenceDeg !== null
@@ -758,6 +1245,47 @@ export function VideoAnalysisPage() {
                   ))}
                 </ul>
               </div>
+            </div>
+          )}
+
+          {/* Documented Conflict Thresholds Returned by CV Service */}
+          {selectedVideo.thresholds && (
+            <div className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-2.5 text-xs">
+              <h3 className="text-sm font-semibold text-[#F5F8FC]">
+                Documented Conflict Thresholds
+              </h3>
+              <div className="grid grid-cols-2 gap-2 font-mono text-[11px] text-[#A9B8CA]">
+                {selectedVideo.thresholds.proximity_px !== undefined && (
+                  <div>
+                    Proximity: <span className="text-[#F5F8FC]">{selectedVideo.thresholds.proximity_px} px</span>
+                  </div>
+                )}
+                {selectedVideo.thresholds.max_ttc_s !== undefined && (
+                  <div>
+                    Max TTC: <span className="text-[#F5F8FC]">{selectedVideo.thresholds.max_ttc_s}s</span>
+                  </div>
+                )}
+                {selectedVideo.thresholds.max_pet_s !== undefined && (
+                  <div>
+                    Max PET: <span className="text-[#F5F8FC]">{selectedVideo.thresholds.max_pet_s}s</span>
+                  </div>
+                )}
+                {selectedVideo.thresholds.min_closing_speed_px_per_s !== undefined && (
+                  <div>
+                    Min Closing: <span className="text-[#F5F8FC]">{selectedVideo.thresholds.min_closing_speed_px_per_s} px/s</span>
+                  </div>
+                )}
+              </div>
+              {selectedVideo.thresholds.severity && (
+                <div className="pt-2 border-t border-[#233B56] space-y-1 text-[11px] text-[#A9B8CA]">
+                  {Object.entries(selectedVideo.thresholds.severity).map(([band, rule]) => (
+                    <p key={band}>
+                      <span className="font-mono uppercase text-[#F5F8FC]">{band}:</span>{' '}
+                      {String(rule)}
+                    </p>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>

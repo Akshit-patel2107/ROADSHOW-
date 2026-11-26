@@ -268,7 +268,7 @@ export function DemoModePage() {
           </div>
 
           <div className="p-3.5 rounded-md bg-[#071426] border border-[#233B56] text-xs text-[#A9B8CA] leading-relaxed">
-            <strong className="text-[#F5F8FC]">Transparency Notice:</strong> Precomputed Anand pilot records are strictly isolated inside Demonstration Mode. Uploading a new video invokes the real backend validation (ffprobe), thumbnail extraction, and storage pipeline, and forwards footage to the configured external CV worker (<span className="font-mono">CV_SERVICE_URL</span>) — honestly reporting Real CV Analysis as unavailable if no worker is connected, without fabricating fake detections.
+            <strong className="text-[#F5F8FC]">Transparency Notice:</strong> Precomputed Anand pilot records are strictly isolated inside Demonstration Mode. Uploading a new video invokes the real backend validation (ffprobe), thumbnail extraction, storage, and server-side Gemini AI multimodal video analysis pipeline — never fabricating synthetic events if analysis fails.
           </div>
         </div>
       </section>

@@ -24,6 +24,7 @@ import {
   Info,
   MapPin,
   ShieldCheck,
+  Sparkles,
   Upload,
   Users,
   Video,
@@ -165,8 +166,17 @@ export function DashboardPage() {
     };
     const counts = new Map<string, number>();
     for (const v of scopedVideos) {
-      for (const traj of v.trajectories || []) {
-        counts.set(traj.objectClass, (counts.get(traj.objectClass) ?? 0) + 1);
+      if (v.trajectories && v.trajectories.length > 0) {
+        for (const traj of v.trajectories) {
+          counts.set(traj.objectClass, (counts.get(traj.objectClass) ?? 0) + 1);
+        }
+      } else if (v.detectionsSummary?.by_class) {
+        for (const [cls, val] of Object.entries(v.detectionsSummary.by_class)) {
+          const num = Number(val || 0);
+          if (num > 0) {
+            counts.set(cls, (counts.get(cls) ?? 0) + num);
+          }
+        }
       }
     }
     if (counts.size === 0) {
@@ -183,6 +193,18 @@ export function DashboardPage() {
       }))
       .sort((a, b) => b.count - a.count);
   }, [scopedVideos, scopedEvents]);
+
+  const geminiAnalyzedVideos = useMemo(
+    () =>
+      scopedVideos
+        .filter((v) => Boolean(v.geminiAnalysis))
+        .sort((a, b) =>
+          (b.geminiAnalysis?.analyzed_at || b.uploadedAt).localeCompare(
+            a.geminiAnalysis?.analyzed_at || a.uploadedAt
+          )
+        ),
+    [scopedVideos]
+  );
 
   // 1, 2, 3. Daily / Weekly / Monthly conflict trend
   const trendData = useMemo(() => {
@@ -553,6 +575,131 @@ export function DashboardPage() {
         </div>
       </section>
 
+      {/* Latest Gemini AI Video Analysis Insights */}
+      <section
+        aria-label="Latest AI Video Analysis Insights"
+        data-testid="dashboard-gemini-insights"
+        className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold text-[#F5F8FC] flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-[#45B5FF]" aria-hidden="true" />
+              Latest AI Video Analysis Insights
+            </h2>
+            <p className="text-xs text-[#A9B8CA]">
+              Structured Gemini multimodal analysis summaries, detected objects, and clickable timestamps from uploaded footage
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate('/upload')}
+            className="text-xs font-medium text-[#45B5FF] hover:underline whitespace-nowrap"
+          >
+            Analyse New Video
+          </button>
+        </div>
+
+        {geminiAnalyzedVideos.length === 0 ? (
+          <div className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <p className="text-xs text-[#A9B8CA] leading-relaxed">
+              No uploaded clips in this project have been analysed by the Gemini AI video pipeline yet. Upload an MP4, MOV, or WebM clip to view structured AI summaries, object counts, and timestamped moments here.
+            </p>
+            <button
+              type="button"
+              onClick={() => navigate('/upload')}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#2585FF] hover:bg-[#1C74E8] text-white text-xs font-medium rounded-md whitespace-nowrap shrink-0"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              Upload Clip
+            </button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {geminiAnalyzedVideos.slice(0, 2).map((vid) => {
+              const ga = vid.geminiAnalysis!;
+              return (
+                <div
+                  key={vid.id}
+                  className="p-4 rounded-md bg-[#0D1F35] border border-[#233B56] space-y-3"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => navigate(`/video-analysis/${vid.id}`)}
+                        className="text-sm font-semibold text-[#F5F8FC] hover:text-[#45B5FF] truncate block text-left"
+                      >
+                        {vid.title}
+                      </button>
+                      <p className="text-[11px] font-mono text-[#A9B8CA] mt-0.5">
+                        {ga.model_version} · {vid.durationSec}s · {ga.events.length} timeline events
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => navigate(`/video-analysis/${vid.id}`)}
+                      className="text-xs text-[#45B5FF] hover:underline whitespace-nowrap shrink-0"
+                    >
+                      Open Analysis
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-[#F5F8FC] leading-relaxed">{ga.video_summary}</p>
+
+                  {ga.detected_objects.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {ga.detected_objects.slice(0, 6).map((obj, idx) => (
+                        <span
+                          key={`${obj.label}-${idx}`}
+                          className="px-2 py-0.5 rounded bg-[#122943] border border-[#233B56] text-[11px] font-mono text-[#CBD5E1]"
+                        >
+                          {obj.label}: ~{obj.count_estimate}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {(ga.important_moments.length > 0 || ga.events.length > 0) && (
+                    <div className="pt-2 border-t border-[#233B56] space-y-1.5">
+                      <p className="text-[11px] font-medium text-[#A9B8CA]">
+                        Key Timestamps (click to jump):
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(ga.important_moments.length > 0
+                          ? ga.important_moments.slice(0, 3).map((m) => ({
+                              ts: m.timestamp,
+                              sec: m.timestamp_sec,
+                              label: m.description,
+                            }))
+                          : ga.events.slice(0, 3).map((ev) => ({
+                              ts: ev.timestamp_start,
+                              sec: ev.timestamp_start_sec,
+                              label: ev.event,
+                            }))
+                        ).map((item, idx) => (
+                          <button
+                            key={`${item.ts}-${idx}`}
+                            type="button"
+                            onClick={() =>
+                              navigate(`/video-analysis/${vid.id}?t=${item.sec}`)
+                            }
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#122943] hover:bg-[#173252] border border-[#2585FF]/40 text-[11px] text-[#F5F8FC] max-w-full"
+                          >
+                            <span className="font-mono text-[#45B5FF] shrink-0">@{item.ts}</span>
+                            <span className="truncate max-w-[200px]">{item.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* 6.2 Charts Section — Row 1: Trend (Daily/Weekly/Monthly) + Risk Category Distribution */}
       <section className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-[#122943] border border-[#233B56] rounded-lg p-5">
@@ -836,7 +983,7 @@ export function DashboardPage() {
                       </div>
                     )}
                     <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded bg-[#071426]/85 text-[10px] font-mono tabular-nums text-[#F5F8FC]">
-                      {vid.durationSec}s · {vid.status === 'Failed' ? 'CV Failed' : `${vidEventCount} ev`}
+                      {vid.durationSec}s · {vid.status === 'Failed' ? 'AI Failed' : `${vidEventCount} ev`}
                     </span>
                   </div>
                   <div className="p-2.5">

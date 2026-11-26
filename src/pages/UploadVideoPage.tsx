@@ -14,7 +14,19 @@ import {
 import { useRoadshadow } from '../context/RoadshadowContext';
 import { canPerformAction, sanitizeFirestoreId, validateCoordinates, validateVideoFileMeta } from '../engine/validation';
 import { fetchDemoSampleVideoFile, roadshadowFetch, uploadVideoWithProgress } from '../lib/apiClient';
-import type { ConflictEvent, FrameDetection, ProcessingJob, TrackedTrajectory, VideoRecord } from '../types/roadshadow';
+import type {
+  ConflictEvent,
+  CvConflictRecord,
+  CvDetectionsSummary,
+  CvThresholds,
+  CvTrackRecord,
+  CvVideoMetadata,
+  FrameDetection,
+  GeminiVideoAnalysis,
+  ProcessingJob,
+  TrackedTrajectory,
+  VideoRecord,
+} from '../types/roadshadow';
 
 export function UploadVideoPage() {
   const {
@@ -63,7 +75,7 @@ export function UploadVideoPage() {
   const [validationError, setValidationError] = useState<string | null>(null);
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
   const [workflowStatus, setWorkflowStatus] = useState<
-    'Draft' | 'Uploading' | 'Uploaded' | 'Queued' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled'
+    'Draft' | 'Uploading' | 'Uploaded' | 'Queued' | 'Analyzing' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled'
   >('Draft');
   const [uploadProgress, setUploadProgress] = useState(0);
   const [activeJob, setActiveJob] = useState<ProcessingJob | null>(null);
@@ -249,7 +261,14 @@ export function UploadVideoPage() {
       xhrRef.current.abort();
       xhrRef.current = null;
     }
-    if (activeJob && (workflowStatus === 'Queued' || workflowStatus === 'Processing')) {
+    if (
+      activeJob &&
+      (workflowStatus === 'Queued' ||
+        workflowStatus === 'Analyzing' ||
+        workflowStatus === 'Processing' ||
+        workflowStatus === 'AI Analysis' ||
+        workflowStatus === 'Saving Results')
+    ) {
       await roadshadowFetch(`/api/processing/jobs/${activeJob.id}/cancel`, {
         method: 'POST',
         isDemoMode,
@@ -342,17 +361,29 @@ export function UploadVideoPage() {
       const { job: initialJob } = (await jobResp.json()) as { job: ProcessingJob };
       setActiveJob(initialJob);
 
-      // 3. Poll real backend job status until terminal state
+      // 3. Poll real backend Gemini AI job status until terminal state
       let currentJob: ProcessingJob & {
         resultPayload?: {
+          videoMetadata?: CvVideoMetadata;
+          geminiAnalysis?: GeminiVideoAnalysis;
+          detectionsSummary?: CvDetectionsSummary;
+          tracks?: CvTrackRecord[];
+          conflicts?: CvConflictRecord[];
+          thresholds?: CvThresholds;
           detections: FrameDetection[];
           trajectories: TrackedTrajectory[];
           events: ConflictEvent[];
         };
       } = initialJob;
 
-      while (currentJob.status === 'Queued' || currentJob.status === 'Processing') {
-        await new Promise((r) => setTimeout(r, 450));
+      while (
+        currentJob.status === 'Queued' ||
+        currentJob.status === 'Analyzing' ||
+        currentJob.status === 'Processing' ||
+        currentJob.status === 'AI Analysis' ||
+        currentJob.status === 'Saving Results'
+      ) {
+        await new Promise((r) => setTimeout(r, 700));
         const pollResp = await roadshadowFetch(`/api/processing/jobs/${initialJob.id}`, {
           isDemoMode,
           demoRole: currentUser.role,
@@ -375,9 +406,14 @@ export function UploadVideoPage() {
       const nowIso = new Date().toISOString();
       const failureMsg =
         currentJob.errorMessage ||
-        'Real CV worker is unavailable. Uploaded video has been saved safely for playback and later retry.';
+        'Gemini AI video analysis could not complete. Uploaded video has been saved safely for playback and later retry.';
+      const rp = currentJob.resultPayload;
 
-      // Always persist the uploaded video record to the project (even if automated CV failed)
+      if (analysisSucceeded) {
+        setWorkflowStatus('Saving Results');
+      }
+
+      // Always persist the uploaded video record to the project (even if AI analysis failed)
       const newVideo: VideoRecord = {
         id: videoId,
         projectId: effectiveProjectId,
@@ -396,20 +432,25 @@ export function UploadVideoPage() {
         ...(longitude.trim() ? { longitude: Number(longitude) } : {}),
         roadType,
         description: description.trim(),
-        durationSec: uploadResponse.durationSec || 0,
-        width: uploadResponse.width ?? undefined,
-        height: uploadResponse.height ?? undefined,
-        fps: uploadResponse.fps ?? undefined,
+        durationSec: rp?.videoMetadata?.duration || uploadResponse.durationSec || 0,
+        width: rp?.videoMetadata?.width ?? uploadResponse.width ?? undefined,
+        height: rp?.videoMetadata?.height ?? uploadResponse.height ?? undefined,
+        fps: rp?.videoMetadata?.fps ?? uploadResponse.fps ?? undefined,
         status: analysisSucceeded ? 'Completed' : 'Failed',
         errorMessage: analysisSucceeded ? undefined : failureMsg,
         isDemonstration: false,
-        detections: analysisSucceeded ? currentJob.resultPayload?.detections || [] : [],
-        trajectories: analysisSucceeded ? currentJob.resultPayload?.trajectories || [] : [],
+        geminiAnalysis: analysisSucceeded ? rp?.geminiAnalysis : undefined,
+        detectionsSummary: analysisSucceeded ? rp?.detectionsSummary : undefined,
+        tracks: analysisSucceeded ? rp?.tracks || [] : [],
+        conflicts: analysisSucceeded ? rp?.conflicts || [] : [],
+        thresholds: analysisSucceeded ? rp?.thresholds : undefined,
+        detections: analysisSucceeded ? rp?.detections || [] : [],
+        trajectories: analysisSucceeded ? rp?.trajectories || [] : [],
         createdAt: nowIso,
         updatedAt: nowIso,
       };
 
-      const detectedEvents = analysisSucceeded ? currentJob.resultPayload?.events || [] : [];
+      const detectedEvents = analysisSucceeded ? rp?.events || [] : [];
 
       await registerUploadedVideoAndResults({
         video: newVideo,
@@ -423,17 +464,18 @@ export function UploadVideoPage() {
 
       if (analysisSucceeded) {
         setWorkflowStatus('Completed');
+        const timelineCount = rp?.geminiAnalysis?.events?.length ?? 0;
         pushToast({
           type: 'success',
-          title: 'Video Processing Completed',
-          description: `${detectedEvents.length} candidate conflict events saved to workspace.`,
+          title: 'Gemini AI Video Analysis Completed',
+          description: `${timelineCount} timeline observation(s) and ${detectedEvents.length} safety event(s) saved.`,
         });
       } else {
         setWorkflowStatus('Failed');
         setErrorDetail(failureMsg);
         pushToast({
           type: 'warning',
-          title: 'Video Saved — CV Analysis Unavailable',
+          title: 'Video Saved — AI Analysis Failed',
           description: failureMsg,
         });
       }
@@ -468,7 +510,7 @@ export function UploadVideoPage() {
         </button>
       </div>
 
-      {/* Honest Live CV Worker Health Notice */}
+      {/* Honest Live Gemini AI Video Analysis Engine Status Notice */}
       <div
         data-testid="cv-engine-status-banner"
         className={`p-4 rounded-lg bg-[#122943] border flex flex-col sm:flex-row sm:items-start justify-between gap-3 ${
@@ -485,19 +527,22 @@ export function UploadVideoPage() {
           />
           <div className="text-xs text-[#A9B8CA] leading-relaxed">
             <p className="text-sm font-medium text-[#F5F8FC]">
-              Real Analysis CV Worker:{' '}
+              Gemini AI Video Analysis Engine:{' '}
               {serverHealth.cvAdapter.status === 'available'
-                ? `Connected (${serverHealth.cvAdapter.modelVersion || 'YOLO + ByteTrack'}${
-                    serverHealth.cvAdapter.latencyMs !== null ? `, ${serverHealth.cvAdapter.latencyMs} ms` : ''
+                ? `Ready (${serverHealth.cvAdapter.modelVersion || 'gemini-4-hydrogen'}${
+                    serverHealth.cvAdapter.latencyMs !== null &&
+                    serverHealth.cvAdapter.latencyMs !== undefined
+                      ? `, ${serverHealth.cvAdapter.latencyMs} ms`
+                      : ''
                   })`
                 : serverHealth.cvAdapter.status === 'unavailable'
-                  ? 'Configured but Unreachable'
-                  : 'Not Configured (CV_SERVICE_URL Unset)'}
+                  ? 'API Connection Issue'
+                  : 'GEMINI_API_KEY Required on Server'}
             </p>
             <p className="mt-1">
               Permitted formats: <strong className="text-[#F5F8FC]">MP4, MOV, WebM</strong> · Maximum file size:{' '}
               <strong className="text-[#F5F8FC] font-mono tabular-nums">{maxUploadMb} MB</strong>.{' '}
-              {serverHealth.cvAdapter.message} Uploaded videos are validated with ffprobe, stored safely in your project, and never produce fabricated detections when the CV service is unavailable.
+              {serverHealth.cvAdapter.message} Uploaded videos are validated with ffprobe, stored safely in your project, and analyzed server-side with Gemini multimodal AI without ever fabricating results.
             </p>
           </div>
         </div>
@@ -515,7 +560,7 @@ export function UploadVideoPage() {
           className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D1F35] hover:bg-[#1B3A5E] border border-[#233B56] rounded-md text-xs text-[#F5F8FC] whitespace-nowrap shrink-0 self-start"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${refreshingHealth ? 'animate-spin' : ''}`} />
-          Check CV Status
+          Check AI Status
         </button>
       </div>
 
@@ -826,7 +871,10 @@ export function UploadVideoPage() {
                   !canUpload ||
                   workflowStatus === 'Uploading' ||
                   workflowStatus === 'Queued' ||
-                  workflowStatus === 'Processing'
+                  workflowStatus === 'Analyzing' ||
+                  workflowStatus === 'Processing' ||
+                  workflowStatus === 'AI Analysis' ||
+                  workflowStatus === 'Saving Results'
                 }
                 className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#2585FF] hover:bg-[#1C74E8] disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors whitespace-nowrap"
               >
@@ -835,7 +883,10 @@ export function UploadVideoPage() {
               </button>
               {(workflowStatus === 'Uploading' ||
                 workflowStatus === 'Queued' ||
-                workflowStatus === 'Processing') && (
+                workflowStatus === 'Analyzing' ||
+                workflowStatus === 'Processing' ||
+                workflowStatus === 'AI Analysis' ||
+                workflowStatus === 'Saving Results') && (
                 <button
                   type="button"
                   onClick={handleCancel}
@@ -847,115 +898,223 @@ export function UploadVideoPage() {
             </div>
           </div>
 
-          {/* Processing Job State Panel */}
-          {workflowStatus !== 'Draft' && (
-            <div className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-[#F5F8FC]">Processing Pipeline Status</h3>
-                <span className="text-xs font-mono text-[#45B5FF]">{workflowStatus}</span>
-              </div>
+          {/* Pipeline Status Stepper & Job Progress Panel */}
+          <div
+            data-testid="upload-pipeline-stepper"
+            className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-[#F5F8FC]">Processing Pipeline Status</h3>
+              <span
+                data-testid="pipeline-current-status"
+                className={`text-xs font-mono ${
+                  workflowStatus === 'Completed'
+                    ? 'text-[#22C55E]'
+                    : workflowStatus === 'Failed' || workflowStatus === 'Cancelled'
+                      ? 'text-[#E5484D]'
+                      : workflowStatus === 'Draft'
+                        ? 'text-[#A9B8CA]'
+                        : 'text-[#45B5FF]'
+                }`}
+              >
+                {workflowStatus}
+              </span>
+            </div>
 
-              <div className="w-full h-2 bg-[#071426] rounded overflow-hidden">
-                <div
-                  className="h-full bg-[#2585FF] transition-all duration-300"
-                  style={{
-                    width: `${
-                      workflowStatus === 'Uploading'
-                        ? uploadProgress
-                        : activeJob?.progress ?? (workflowStatus === 'Completed' ? 100 : 15)
-                    }%`,
-                  }}
-                />
-              </div>
+            {/* 6-Stage Gemini Pipeline Indicator: Uploaded -> Queued -> Processing -> AI Analysis -> Saving -> Completed / Failed */}
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5 text-[10px] font-mono">
+              {(['Uploaded', 'Queued', 'Processing', 'AI Analysis', 'Saving', 'Terminal'] as const).map(
+                (step, idx) => {
+                  const rank =
+                    workflowStatus === 'Draft'
+                      ? -1
+                      : workflowStatus === 'Uploading' || workflowStatus === 'Uploaded'
+                        ? 0
+                        : workflowStatus === 'Queued'
+                          ? 1
+                          : workflowStatus === 'Processing'
+                            ? 2
+                            : workflowStatus === 'AI Analysis' || workflowStatus === 'Analyzing'
+                              ? 3
+                              : workflowStatus === 'Saving Results'
+                                ? 4
+                                : 5;
+                  const label =
+                    step === 'Uploaded' && workflowStatus === 'Uploading'
+                      ? 'Uploading'
+                      : step === 'Terminal'
+                        ? workflowStatus === 'Failed'
+                          ? 'Failed'
+                          : workflowStatus === 'Cancelled'
+                            ? 'Cancelled'
+                            : 'Completed'
+                        : step;
+                  const isDone = rank > idx || (idx === 5 && workflowStatus === 'Completed');
+                  const isCurrent =
+                    rank === idx &&
+                    workflowStatus !== 'Completed' &&
+                    workflowStatus !== 'Failed' &&
+                    workflowStatus !== 'Cancelled';
+                  const isFailedTerminal =
+                    idx === 5 && (workflowStatus === 'Failed' || workflowStatus === 'Cancelled');
 
-              {(workflowStatus === 'Uploading' ||
-                workflowStatus === 'Queued' ||
-                workflowStatus === 'Processing') && (
-                <div className="flex items-center gap-2 text-xs text-[#A9B8CA]">
-                  <Loader2 className="w-4 h-4 animate-spin text-[#45B5FF]" />
-                  <span>
-                    {workflowStatus === 'Uploading'
-                      ? `Uploading footage (${uploadProgress}%)...`
-                      : `Job ${activeJob?.id || ''} is ${workflowStatus.toLowerCase()} (${activeJob?.progress ?? 0}%)...`}
-                  </span>
-                </div>
-              )}
-
-              {workflowStatus === 'Completed' && completedVideoId && (
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-xs text-[#22C55E]">
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    <span>
-                      Analysis complete · {activeJob?.conflictCount ?? 0} potential conflicts ·{' '}
-                      {activeJob?.trackingCount ?? 0} tracked road users
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => navigate(`/video-analysis/${completedVideoId}`)}
-                    className="w-full px-4 py-2 bg-[#2585FF] hover:bg-[#1C74E8] text-white text-xs font-medium rounded-md transition-colors whitespace-nowrap"
-                  >
-                    Open Video Analysis Results
-                  </button>
-                </div>
-              )}
-
-              {workflowStatus === 'Failed' && (
-                <div className="space-y-3">
-                  <div className="flex items-start gap-2 text-xs text-[#E5484D]">
-                    <XCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                    <span>{errorDetail || 'Automated CV processing did not complete.'}</span>
-                  </div>
-                  {completedVideoId && (
-                    <p className="text-[11px] text-[#A9B8CA]">
-                      Your uploaded video file is safely stored in the project and can be played immediately or re-analysed once the CV worker is connected.
-                    </p>
-                  )}
-                  <div className="flex flex-wrap gap-2">
-                    {completedVideoId ? (
-                      <>
-                        <button
-                          type="button"
-                          disabled={retryingVideoId === completedVideoId}
-                          onClick={async () => {
-                            setRetryingVideoId(completedVideoId);
-                            try {
-                              await retryVideoAnalysis(completedVideoId);
-                              void loadBackendJobs();
-                            } finally {
-                              setRetryingVideoId(null);
-                            }
-                          }}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D1F35] border border-[#2585FF]/50 text-xs font-medium text-[#45B5FF] rounded-md hover:bg-[#173252] disabled:opacity-50 whitespace-nowrap"
-                        >
-                          <RefreshCw
-                            className={`w-3.5 h-3.5 ${retryingVideoId === completedVideoId ? 'animate-spin' : ''}`}
-                          />
-                          Retry CV Analysis
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => navigate(`/video-analysis/${completedVideoId}`)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#2585FF] hover:bg-[#1C74E8] text-white text-xs font-medium rounded-md whitespace-nowrap"
-                        >
-                          Open Stored Video
-                        </button>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => void startUploadAndProcess()}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D1F35] border border-[#233B56] text-xs font-medium text-[#F5F8FC] rounded-md hover:border-[#2585FF] whitespace-nowrap"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5" />
-                        Retry Upload
-                      </button>
-                    )}
-                  </div>
-                </div>
+                  return (
+                    <div
+                      key={step}
+                      className={`px-1.5 py-1.5 rounded border text-center truncate ${
+                        isFailedTerminal
+                          ? 'bg-[#E5484D]/15 border-[#E5484D]/50 text-[#E5484D]'
+                          : isDone
+                            ? 'bg-[#22C55E]/15 border-[#22C55E]/40 text-[#22C55E]'
+                            : isCurrent
+                              ? 'bg-[#2585FF]/20 border-[#2585FF] text-[#45B5FF]'
+                              : 'bg-[#0D1F35] border-[#233B56] text-[#A9B8CA]'
+                      }`}
+                    >
+                      {label}
+                    </div>
+                  );
+                }
               )}
             </div>
-          )}
+
+            {workflowStatus !== 'Draft' && (
+              <>
+                <div className="w-full h-2 bg-[#071426] rounded overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-300 ${
+                      workflowStatus === 'Failed' || workflowStatus === 'Cancelled'
+                        ? 'bg-[#E5484D]'
+                        : workflowStatus === 'Completed'
+                          ? 'bg-[#22C55E]'
+                          : 'bg-[#2585FF]'
+                    }`}
+                    style={{
+                      width: `${
+                        workflowStatus === 'Uploading'
+                          ? uploadProgress
+                          : workflowStatus === 'Failed' || workflowStatus === 'Cancelled'
+                            ? 100
+                            : workflowStatus === 'Completed'
+                              ? 100
+                              : activeJob?.progress ?? 15
+                      }%`,
+                    }}
+                  />
+                </div>
+
+                {(workflowStatus === 'Uploading' ||
+                  workflowStatus === 'Uploaded' ||
+                  workflowStatus === 'Queued' ||
+                  workflowStatus === 'Analyzing' ||
+                  workflowStatus === 'Processing' ||
+                  workflowStatus === 'AI Analysis' ||
+                  workflowStatus === 'Saving Results') && (
+                  <div className="flex items-center gap-2 text-xs text-[#A9B8CA]">
+                    <Loader2 className="w-4 h-4 animate-spin text-[#45B5FF] shrink-0" />
+                    <span>
+                      {workflowStatus === 'Uploading'
+                        ? `Uploading footage to server (${uploadProgress}%)...`
+                        : activeJob?.stageMessage ||
+                          `Stage: ${workflowStatus}...`}
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
+
+            {workflowStatus === 'Draft' && (
+              <p className="text-xs text-[#A9B8CA]">
+                Ready: footage uploads to server storage, transfers to Gemini Files API, runs structured multimodal AI analysis, and saves validated timeline events to Firestore.
+              </p>
+            )}
+
+            {workflowStatus === 'Completed' && completedVideoId && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-xs text-[#22C55E]">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <span>
+                    Analysis complete ({activeJob?.modelVersion || 'gemini-4-hydrogen'}) ·{' '}
+                    {activeJob?.trackingCount ?? 0} timeline observations ·{' '}
+                    {activeJob?.conflictCount ?? 0} safety conflicts
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => navigate(`/video-analysis/${completedVideoId}`)}
+                  className="w-full px-4 py-2 bg-[#2585FF] hover:bg-[#1C74E8] text-white text-xs font-medium rounded-md transition-colors whitespace-nowrap"
+                >
+                  Open Video Analysis Results
+                </button>
+              </div>
+            )}
+
+            {workflowStatus === 'Failed' && (
+              <div className="space-y-3">
+                <div className="flex items-start gap-2 text-xs text-[#E5484D]">
+                  <XCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{errorDetail || 'Gemini AI video analysis did not complete.'}</span>
+                </div>
+                {completedVideoId && (
+                  <p className="text-[11px] text-[#A9B8CA]">
+                    Your uploaded video file is safely stored in the project and can be played immediately or re-analysed without uploading again.
+                  </p>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  {completedVideoId ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={retryingVideoId === completedVideoId}
+                        onClick={async () => {
+                          setRetryingVideoId(completedVideoId);
+                          setErrorDetail(null);
+                          setWorkflowStatus('Queued');
+                          try {
+                            const res = await retryVideoAnalysis(completedVideoId, (liveJob) => {
+                              setActiveJob(liveJob);
+                              setWorkflowStatus(liveJob.status);
+                            });
+                            if (res.ok) {
+                              setWorkflowStatus('Completed');
+                            } else {
+                              setWorkflowStatus('Failed');
+                              setErrorDetail(res.error || 'Gemini AI video analysis failed.');
+                            }
+                            void loadBackendJobs();
+                          } finally {
+                            setRetryingVideoId(null);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D1F35] border border-[#2585FF]/50 text-xs font-medium text-[#45B5FF] rounded-md hover:bg-[#173252] disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${retryingVideoId === completedVideoId ? 'animate-spin' : ''}`}
+                        />
+                        Retry AI Analysis
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => navigate(`/video-analysis/${completedVideoId}`)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#2585FF] hover:bg-[#1C74E8] text-white text-xs font-medium rounded-md whitespace-nowrap"
+                      >
+                        Open Stored Video
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void startUploadAndProcess()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D1F35] border border-[#233B56] text-xs font-medium text-[#F5F8FC] rounded-md hover:border-[#2585FF] whitespace-nowrap"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Retry Upload
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </form>
 
@@ -1007,11 +1166,13 @@ export function UploadVideoPage() {
                         {matchedVideo?.title || job.videoId}
                       </td>
                       <td className="py-2.5 px-4 text-[#A9B8CA] whitespace-nowrap">
-                        {job.engineMode === 'CV_SERVICE'
-                          ? 'Real CV Worker'
+                        {job.engineMode === 'GEMINI_AI'
+                          ? `Gemini AI (${job.modelVersion || 'gemini-4-hydrogen'})`
                           : job.engineMode === 'DEMONSTRATION'
                             ? 'Demo Precomputed'
-                            : 'CV Service Unavailable'}
+                            : job.engineMode === 'CV_SERVICE'
+                              ? 'Legacy CV Service'
+                              : 'AI Unavailable'}
                       </td>
                       <td className="py-2.5 px-4 whitespace-nowrap">
                         <span
@@ -1024,7 +1185,10 @@ export function UploadVideoPage() {
                           }`}
                         >
                           <Clock className="w-3.5 h-3.5" />
-                          {job.status} ({job.progress}%)
+                          {job.status}
+                          {job.status === 'Completed' || job.status === 'Failed' || job.status === 'Cancelled'
+                            ? ''
+                            : ` (${job.progress}%)`}
                         </span>
                       </td>
                       <td className="py-2.5 px-4 text-right font-mono tabular-nums text-[#F5F8FC]">
@@ -1032,14 +1196,17 @@ export function UploadVideoPage() {
                       </td>
                       <td className="py-2.5 px-4 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-2.5">
-                          {job.status === 'Failed' && matchedVideo && !matchedVideo.isDemonstration && canUpload && (
-                            <button
-                              type="button"
-                              disabled={retryingVideoId === matchedVideo.id}
-                              onClick={async () => {
-                                setRetryingVideoId(matchedVideo.id);
-                                try {
-                                  await retryVideoAnalysis(matchedVideo.id);
+                          {(job.status === 'Failed' || job.status === 'Cancelled') &&
+                            matchedVideo &&
+                            !matchedVideo.isDemonstration &&
+                            canUpload && (
+                              <button
+                                type="button"
+                                disabled={retryingVideoId === matchedVideo.id}
+                                onClick={async () => {
+                                  setRetryingVideoId(matchedVideo.id);
+                                  try {
+                                    await retryVideoAnalysis(matchedVideo.id);
                                   void loadBackendJobs();
                                 } finally {
                                   setRetryingVideoId(null);

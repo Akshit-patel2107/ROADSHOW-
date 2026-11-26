@@ -72,6 +72,41 @@ service cloud.firestore {
         snap.fingerprintsIdentified is number && snap.fingerprintsIdentified >= 0;
     }
 
+    function isValidGeminiAnalysis(g) {
+      return g is map &&
+        g.keys().hasAll([
+          'video_summary',
+          'duration_seconds',
+          'events',
+          'detected_objects',
+          'important_moments',
+          'safety_observations',
+          'overall_assessment',
+          'model_version',
+          'analyzed_at'
+        ]) &&
+        g.keys().hasOnly([
+          'video_summary',
+          'duration_seconds',
+          'events',
+          'detected_objects',
+          'important_moments',
+          'safety_observations',
+          'overall_assessment',
+          'model_version',
+          'analyzed_at'
+        ]) &&
+        isValidString(g.video_summary, 1, 2000) &&
+        g.duration_seconds is number && g.duration_seconds >= 0 && g.duration_seconds <= 86400 &&
+        g.events is list && g.events.size() <= 60 &&
+        g.detected_objects is list && g.detected_objects.size() <= 40 &&
+        g.important_moments is list && g.important_moments.size() <= 40 &&
+        g.safety_observations is list && g.safety_observations.size() <= 30 &&
+        isValidString(g.overall_assessment, 1, 2000) &&
+        isValidString(g.model_version, 2, 120) &&
+        isValidString(g.analyzed_at, 4, 64);
+    }
+
     // --- Validation Blueprints ---
 
     function isValidUserPublic(data) {
@@ -179,21 +214,43 @@ service cloud.firestore {
         isValidString(data.roadType, 2, 80) &&
         isOptionalString(data, 'description', 1000) &&
         data.durationSec is number && data.durationSec >= 0 && data.durationSec <= 86400 &&
-        data.status in ['Draft', 'Uploading', 'Uploaded', 'Queued', 'Processing', 'Completed', 'Failed', 'Cancelled'] &&
+        data.status in ['Draft', 'Uploading', 'Uploaded', 'Queued', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
         data.isDemonstration is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidVideoAnalysis(data) {
+      return data.keys().hasAll(['videoId', 'projectId', 'ownerId', 'jobId', 'modelVersion', 'engineMode', 'detectionsSummary', 'tracks', 'detections', 'trajectories', 'conflicts', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'jobId', 'modelVersion', 'engineMode', 'videoMetadata', 'detectionsSummary', 'geminiAnalysis', 'tracks', 'detections', 'trajectories', 'conflicts', 'thresholds', 'createdAt', 'updatedAt']) &&
+        isValidId(data.videoId) &&
+        isValidId(data.projectId) &&
+        isValidId(data.ownerId) &&
+        isValidId(data.jobId) &&
+        isValidString(data.modelVersion, 2, 120) &&
+        data.engineMode in ['GEMINI_AI', 'CV_SERVICE', 'DEVELOPMENT_FALLBACK', 'DEMONSTRATION'] &&
+        (!('videoMetadata' in data) || data.videoMetadata is map) &&
+        data.detectionsSummary is map &&
+        (!('geminiAnalysis' in data) || isValidGeminiAnalysis(data.geminiAnalysis)) &&
+        data.tracks is list && data.tracks.size() <= 150 &&
+        data.detections is list && data.detections.size() <= 600 &&
+        data.trajectories is list && data.trajectories.size() <= 150 &&
+        data.conflicts is list && data.conflicts.size() <= 100 &&
+        (!('thresholds' in data) || data.thresholds is map) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
 
     function isValidProcessingJob(data) {
       return data.keys().hasAll(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'stageMessage', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'createdAt', 'updatedAt']) &&
         isValidId(data.videoId) &&
         isValidId(data.projectId) &&
         isValidId(data.ownerId) &&
-        data.status in ['Queued', 'Processing', 'Completed', 'Failed', 'Cancelled'] &&
+        data.status in ['Queued', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
         data.progress is number && data.progress >= 0 && data.progress <= 100 &&
-        data.engineMode in ['CV_SERVICE', 'DEVELOPMENT_FALLBACK', 'DEMONSTRATION', 'UNAVAILABLE'] &&
+        isOptionalString(data, 'stageMessage', 300) &&
+        data.engineMode in ['GEMINI_AI', 'CV_SERVICE', 'DEVELOPMENT_FALLBACK', 'DEMONSTRATION', 'UNAVAILABLE'] &&
         isValidString(data.modelVersion, 2, 120) &&
         data.analyzedFrames is number && data.analyzedFrames >= 0 &&
         data.processingTimeMs is number && data.processingTimeMs >= 0 &&
@@ -221,7 +278,7 @@ service cloud.firestore {
 
     function isValidConflictEvent(data) {
       return data.keys().hasAll(['videoId', 'projectId', 'locationId', 'ownerId', 'timestampSec', 'frameNumber', 'conflictType', 'originalConflictType', 'riskScore', 'riskCategory', 'detectionConfidence', 'measurementQuality', 'roadUsers', 'contributingFactors', 'measurementLimitations', 'evidenceSummary', 'validationStatus', 'isDemonstration', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['videoId', 'projectId', 'locationId', 'ownerId', 'timestampSec', 'frameNumber', 'occurredAt', 'conflictType', 'originalConflictType', 'riskScore', 'riskCategory', 'interactionTier', 'detectionConfidence', 'measurementQuality', 'estimatedTtcSec', 'estimatedPetSec', 'evasiveManeuverDetected', 'estimatedMinSeparationPx', 'relativeSpeedPxPerSec', 'trajectoryConvergenceDeg', 'movementDirection', 'roadUsers', 'involvedTrackIds', 'contributingFactors', 'measurementLimitations', 'evidenceSummary', 'validationStatus', 'analystNotes', 'reviewedBy', 'aiExplanation', 'isDemonstration', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'locationId', 'ownerId', 'timestampSec', 'frameNumber', 'occurredAt', 'conflictType', 'originalConflictType', 'severity', 'locationXy', 'detectionMethod', 'riskScore', 'riskCategory', 'interactionTier', 'detectionConfidence', 'measurementQuality', 'estimatedTtcSec', 'estimatedPetSec', 'evasiveManeuverDetected', 'estimatedMinSeparationPx', 'relativeSpeedPxPerSec', 'trajectoryConvergenceDeg', 'movementDirection', 'roadUsers', 'involvedTrackIds', 'contributingFactors', 'measurementLimitations', 'evidenceSummary', 'validationStatus', 'analystNotes', 'reviewedBy', 'aiExplanation', 'isDemonstration', 'createdAt', 'updatedAt']) &&
         isValidId(data.videoId) &&
         isValidId(data.projectId) &&
         isValidId(data.locationId) &&
@@ -231,6 +288,9 @@ service cloud.firestore {
         isOptionalString(data, 'occurredAt', 64) &&
         isValidConflictType(data.conflictType) &&
         isValidConflictType(data.originalConflictType) &&
+        (!('severity' in data) || data.severity in ['low', 'medium', 'high']) &&
+        (!('locationXy' in data) || data.locationXy == null || (data.locationXy is list && data.locationXy.size() == 2)) &&
+        isOptionalString(data, 'detectionMethod', 80) &&
         data.riskScore is number && data.riskScore >= 0 && data.riskScore <= 100 &&
         data.riskCategory in ['Low', 'Medium', 'High', 'Critical'] &&
         (!('interactionTier' in data) || data.interactionTier in ['Potential conflict', 'Near miss']) &&
@@ -496,6 +556,30 @@ service cloud.firestore {
       allow delete: if isValidId(videoId) && (isOwnerUid(existing().ownerId) || isAdmin());
     }
 
+    match /videoAnalyses/{videoId} {
+      allow get: if isValidId(videoId) && (isOwnerUid(existing().ownerId) || isAdmin());
+      allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(videoId) && isValidVideoAnalysis(incoming()) &&
+        incoming().videoId == videoId &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isProjectOwner(incoming().projectId) || isAdmin());
+      allow update: if isVerified() && isValidId(videoId) && isValidVideoAnalysis(incoming()) &&
+        incoming().videoId == existing().videoId &&
+        incoming().projectId == existing().projectId &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['jobId', 'modelVersion', 'engineMode', 'videoMetadata', 'detectionsSummary', 'geminiAnalysis', 'tracks', 'detections', 'trajectories', 'conflicts', 'thresholds', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(videoId) && (isOwnerUid(existing().ownerId) || isAdmin());
+    }
+
     match /processingJobs/{jobId} {
       allow get: if isValidId(jobId) && (isOwnerUid(existing().ownerId) || isAdmin());
       allow list: if isVerified() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
@@ -514,7 +598,7 @@ service cloud.firestore {
           (
             existing().ownerId == request.auth.uid &&
             !(existing().status in ['Completed', 'Failed', 'Cancelled']) &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'progress', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'progress', 'stageMessage', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'updatedAt'])
           )
         );
       allow delete: if isValidId(jobId) && (isOwnerUid(existing().ownerId) || isAdmin());

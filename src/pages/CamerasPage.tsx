@@ -945,7 +945,7 @@ export function CamerasPage() {
               <p className="mt-1">
                 Credentials submitted here are validated by the Express backend and held strictly in server memory — never written to Firestore or exposed in browser storage.
                 {!serverHealth.cvAdapter.rtspIngestionReady &&
-                  ' External CV Worker (CV_SERVICE_URL) is currently not connected, so RTSP streams will honestly report "Not connected" until a Python CV worker is deployed.'}
+                  ' Live RTSP decoding is not enabled in this runtime; use Upload Video for real server-side Gemini AI analysis of recorded clips.'}
               </p>
             </div>
           </div>

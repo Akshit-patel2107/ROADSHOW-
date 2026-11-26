@@ -8,9 +8,17 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, FileState, createPartFromUri } from '@google/genai';
 import { z } from 'zod';
 import { createServer as createViteServer } from 'vite';
+import {
+  buildDetectionsSummaryFromGemini,
+  classifyGeminiApiError,
+  formatSecondsToTimestamp,
+  mapGeminiAnalysisToConflictEvents,
+  validateAndNormalizeGeminiAnalysis,
+  type GeminiVideoAnalysis,
+} from './src/engine/geminiVideoAnalysis';
 
 const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -19,9 +27,14 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD_MB = Math.max(10, Math.min(1024, Number(process.env.MAX_UPLOAD_MB || 250)));
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const CV_TIMEOUT_MS = Math.max(10000, Math.min(300000, Number(process.env.CV_SERVICE_TIMEOUT_MS || 120000)));
-const CV_HEALTH_TIMEOUT_MS = Math.max(1500, Math.min(15000, Number(process.env.CV_HEALTH_TIMEOUT_MS || 5000)));
-const CV_MAX_RETRIES = Math.max(0, Math.min(3, Number(process.env.CV_MAX_RETRIES ?? 2)));
+const GEMINI_VIDEO_MODEL = 'gemini-4-hydrogen';
+const GEMINI_ANALYSIS_TIMEOUT_MS = Math.max(
+  30000,
+  Math.min(300000, Number(process.env.GEMINI_ANALYSIS_TIMEOUT_MS || 180000))
+);
+const GEMINI_INLINE_MAX_BYTES = 15 * 1024 * 1024;
+const ANALYSIS_RATE_LIMIT_MAX = 12;
+const ANALYSIS_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const UPLOADS_DIR = path.resolve(__dirname, 'uploads');
 const THUMBNAILS_DIR = path.resolve(UPLOADS_DIR, 'thumbnails');
 const BOOTSTRAPPED_ADMIN_EMAIL = 'akshitpatel2107@gmail.com';
@@ -448,10 +461,10 @@ async function ensureDemoSampleClip(): Promise<string | null> {
   }
 }
 
-// --- Active External CV Worker Health Probe (cached 5 seconds) ---
-interface CvHealthSnapshot {
+// --- Gemini AI Video Analysis Health Probe (cached 10 seconds) ---
+interface AiVideoHealthSnapshot {
   status: 'available' | 'unavailable' | 'not_configured';
-  mode: 'CV_SERVICE' | 'UNAVAILABLE';
+  mode: 'GEMINI_AI' | 'UNAVAILABLE';
   externalWorkerConfigured: boolean;
   workerReachable: boolean;
   rtspIngestionReady: boolean;
@@ -459,23 +472,27 @@ interface CvHealthSnapshot {
   tracker: string | null;
   device: string | null;
   sampleFps: number | null;
+  classes: string[] | null;
+  asyncJobsSupported: boolean;
+  supportedFormats: string[];
   latencyMs: number | null;
   message: string;
   checkedAt: string;
 }
 
-let cachedCvHealth: CvHealthSnapshot | null = null;
-let cvHealthCacheTime = 0;
+let cachedAiHealth: AiVideoHealthSnapshot | null = null;
+let aiHealthCacheTime = 0;
 
-async function probeCvWorkerHealth(forceRefresh = false): Promise<CvHealthSnapshot> {
+async function probeGeminiVideoHealth(forceRefresh = false): Promise<AiVideoHealthSnapshot> {
   const now = Date.now();
-  if (!forceRefresh && cachedCvHealth && now - cvHealthCacheTime < 5000) {
-    return cachedCvHealth;
+  if (!forceRefresh && cachedAiHealth && now - aiHealthCacheTime < 10000) {
+    return cachedAiHealth;
   }
 
-  const cvServiceUrl = resolveExternalServiceUrl(process.env.CV_SERVICE_URL);
-  if (!cvServiceUrl) {
-    cachedCvHealth = {
+  const ai = getGeminiClient();
+  const supportedFormats = ['video/mp4', 'video/quicktime', 'video/webm'];
+  if (!ai) {
+    cachedAiHealth = {
       status: 'not_configured',
       mode: 'UNAVAILABLE',
       externalWorkerConfigured: false,
@@ -483,89 +500,96 @@ async function probeCvWorkerHealth(forceRefresh = false): Promise<CvHealthSnapsh
       rtspIngestionReady: false,
       modelVersion: null,
       tracker: null,
-      device: null,
+      device: 'Cloud API',
       sampleFps: null,
+      classes: null,
+      asyncJobsSupported: true,
+      supportedFormats,
       latencyMs: null,
       message:
-        'External Python YOLO/ByteTrack CV service (CV_SERVICE_URL) is not configured. Videos can still be uploaded and stored, but automated Real Analysis requires connecting CV_SERVICE_URL.',
+        'GEMINI_API_KEY is not configured on the server. Videos can still be uploaded and stored, and AI analysis can be retried once GEMINI_API_KEY is set.',
       checkedAt: new Date().toISOString(),
     };
-    cvHealthCacheTime = now;
-    return cachedCvHealth;
+    aiHealthCacheTime = now;
+    return cachedAiHealth;
+  }
+
+  if (!forceRefresh && cachedAiHealth && cachedAiHealth.status === 'available') {
+    return cachedAiHealth;
   }
 
   const t0 = Date.now();
   try {
-    const resp = await fetch(`${cvServiceUrl}/health`, {
-      headers: process.env.CV_SERVICE_API_KEY
-        ? { Authorization: `Bearer ${process.env.CV_SERVICE_API_KEY}` }
-        : undefined,
-      signal: AbortSignal.timeout(CV_HEALTH_TIMEOUT_MS),
-    });
-    const latencyMs = Date.now() - t0;
-    if (!resp.ok) {
-      cachedCvHealth = {
-        status: 'unavailable',
-        mode: 'UNAVAILABLE',
-        externalWorkerConfigured: true,
-        workerReachable: false,
-        rtspIngestionReady: false,
-        modelVersion: null,
-        tracker: null,
-        device: null,
-        sampleFps: null,
-        latencyMs,
-        message: `Configured CV worker responded with HTTP ${resp.status}. Real Analysis is currently unavailable.`,
-        checkedAt: new Date().toISOString(),
-      };
-    } else {
-      const json = (await resp.json()) as {
-        status?: string;
-        model_ready?: boolean;
-        model_version?: string;
-        tracker?: string;
-        device?: string;
-        sample_fps?: number;
-        error?: string | null;
-      };
-      const ready = json.status === 'ok' && json.model_ready !== false;
-      cachedCvHealth = {
-        status: ready ? 'available' : 'unavailable',
-        mode: ready ? 'CV_SERVICE' : 'UNAVAILABLE',
-        externalWorkerConfigured: true,
-        workerReachable: true,
-        rtspIngestionReady: ready,
-        modelVersion: json.model_version || 'Ultralytics YOLO+ByteTrack',
-        tracker: json.tracker || 'ByteTrack',
-        device: json.device || null,
-        sampleFps: typeof json.sample_fps === 'number' ? json.sample_fps : null,
-        latencyMs,
-        message: ready
-          ? `Connected to external CV worker (${json.model_version || 'YOLO'} + ${json.tracker || 'ByteTrack'}). Ready for Real Analysis.`
-          : `CV worker is reachable, but its YOLO detection model is not loaded${json.error ? ` (${String(json.error).slice(0, 140)})` : ''}.`,
-        checkedAt: new Date().toISOString(),
-      };
+    // Lightweight server-side connectivity check (lists at most 1 temporary file metadata record)
+    if (forceRefresh) {
+      await ai.files.list({ config: { pageSize: 1 } });
     }
-  } catch {
-    cachedCvHealth = {
+    const latencyMs = forceRefresh ? Date.now() - t0 : null;
+    cachedAiHealth = {
+      status: 'available',
+      mode: 'GEMINI_AI',
+      externalWorkerConfigured: true,
+      workerReachable: true,
+      rtspIngestionReady: false,
+      modelVersion: GEMINI_VIDEO_MODEL,
+      tracker: 'Gemini Multimodal Video Understanding',
+      device: 'Google Gemini API (Server-Side)',
+      sampleFps: null,
+      classes: ['person', 'car', 'motorcycle', 'bicycle', 'bus', 'truck', 'scooter', 'auto_rickshaw'],
+      asyncJobsSupported: true,
+      supportedFormats,
+      latencyMs,
+      message: `Gemini multimodal video analysis (${GEMINI_VIDEO_MODEL}) is configured and ready on the backend.`,
+      checkedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    const classified = classifyGeminiApiError(err);
+    cachedAiHealth = {
       status: 'unavailable',
       mode: 'UNAVAILABLE',
       externalWorkerConfigured: true,
       workerReachable: false,
       rtspIngestionReady: false,
-      modelVersion: null,
-      tracker: null,
-      device: null,
+      modelVersion: GEMINI_VIDEO_MODEL,
+      tracker: 'Gemini Multimodal Video Understanding',
+      device: 'Google Gemini API (Server-Side)',
       sampleFps: null,
+      classes: null,
+      asyncJobsSupported: true,
+      supportedFormats,
       latencyMs: Date.now() - t0,
-      message:
-        'Configured CV worker (CV_SERVICE_URL) is unreachable or timed out. Verify the Python FastAPI CV service is running.',
+      message: classified.userMessage,
       checkedAt: new Date().toISOString(),
     };
   }
 
-  cvHealthCacheTime = now;
-  return cachedCvHealth;
+  aiHealthCacheTime = now;
+  return cachedAiHealth;
+}
+
+// --- Per-User Rate Limiting & Duplicate Job Guard ---
+const ACTIVE_JOB_STATUSES = new Set([
+  'Queued',
+  'Analyzing',
+  'Processing',
+  'AI Analysis',
+  'Saving Results',
+]);
+const analysisRateLimiter = new Map<string, number[]>();
+
+function checkAnalysisRateLimit(uid: string): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  const windowStart = now - ANALYSIS_RATE_LIMIT_WINDOW_MS;
+  const timestamps = (analysisRateLimiter.get(uid) || []).filter((ts) => ts > windowStart);
+  if (timestamps.length >= ANALYSIS_RATE_LIMIT_MAX) {
+    const oldest = timestamps[0] || now;
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + ANALYSIS_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    analysisRateLimiter.set(uid, timestamps);
+    return { allowed: false, retryAfterSec };
+  }
+  timestamps.push(now);
+  analysisRateLimiter.set(uid, timestamps);
+  return { allowed: true, retryAfterSec: 0 };
 }
 
 // --- Asynchronous Processing Job Store & File Ownership Metadata ---
@@ -579,9 +603,18 @@ interface ServerJob {
   durationSec: number;
   occurredAtIso: string;
   analysisMode: 'REAL' | 'DEMO_SAMPLE';
-  status: 'Queued' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled';
+  status:
+    | 'Queued'
+    | 'Analyzing'
+    | 'Processing'
+    | 'AI Analysis'
+    | 'Saving Results'
+    | 'Completed'
+    | 'Failed'
+    | 'Cancelled';
   progress: number;
-  engineMode: 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
+  stageMessage?: string;
+  engineMode: 'GEMINI_AI' | 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
   modelVersion: string;
   analyzedFrames: number;
   processingTimeMs: number;
@@ -591,6 +624,21 @@ interface ServerJob {
   warnings: string[];
   errorMessage?: string;
   resultPayload?: {
+    videoMetadata?: {
+      fps: number;
+      width: number;
+      height: number;
+      resolution: string;
+      duration: number;
+    };
+    geminiAnalysis?: GeminiVideoAnalysis;
+    detectionsSummary?: {
+      total_detections: number;
+      by_class: Record<string, number>;
+    };
+    tracks: unknown[];
+    conflicts: unknown[];
+    thresholds?: Record<string, unknown>;
     detections: unknown[];
     trajectories: unknown[];
     events: unknown[];
@@ -684,6 +732,163 @@ function resolveUploadedFilePath(fileUrl: string): { fileName: string; fullPath:
   return { fileName: safeName, fullPath: resolved };
 }
 
+function findActiveJobForVideo(videoId: string): ServerJob | null {
+  for (const job of jobStore.values()) {
+    if (job.videoId === videoId && ACTIVE_JOB_STATUSES.has(job.status)) {
+      return job;
+    }
+  }
+  return null;
+}
+
+const GEMINI_VIDEO_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    video_summary: {
+      type: Type.STRING,
+      description: 'Concise factual summary of what actually appears in the video.',
+    },
+    duration_seconds: {
+      type: Type.NUMBER,
+      description: 'Approximate or known duration of the video in seconds.',
+    },
+    events: {
+      type: Type.ARRAY,
+      description:
+        'Chronological notable events, traffic interactions, movement changes, or safety incidents visibly observed in the video. Return an empty array if nothing notable occurs.',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          timestamp_start: {
+            type: Type.STRING,
+            description: 'Start timestamp in HH:MM:SS format within the video duration.',
+          },
+          timestamp_end: {
+            type: Type.STRING,
+            description: 'End timestamp in HH:MM:SS format within the video duration.',
+          },
+          is_approximate: {
+            type: Type.BOOLEAN,
+            description: 'True if the timestamp is an approximate estimate rather than frame-exact.',
+          },
+          event: {
+            type: Type.STRING,
+            description: 'Objective factual description of what happened in the footage.',
+          },
+          objects_detected: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Visible objects/road users involved (e.g. person, car, motorcycle, bus, truck, bicycle).',
+          },
+          activity: {
+            type: Type.STRING,
+            description: 'Observed motion or activity (e.g. crossing intersection, sudden braking, pedestrian waiting).',
+          },
+          confidence: {
+            type: Type.STRING,
+            description: 'Confidence level: low, medium, or high.',
+          },
+          risk_level: {
+            type: Type.STRING,
+            description: 'Safety risk level: low, medium, high, or critical.',
+          },
+          reason: {
+            type: Type.STRING,
+            description: 'Visual evidence supporting this classification, separated clearly from speculation.',
+          },
+        },
+        required: [
+          'timestamp_start',
+          'timestamp_end',
+          'is_approximate',
+          'event',
+          'objects_detected',
+          'activity',
+          'confidence',
+          'risk_level',
+          'reason',
+        ],
+      },
+    },
+    detected_objects: {
+      type: Type.ARRAY,
+      description: 'Distinct visible object or road-user categories actually seen in the footage.',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          label: { type: Type.STRING },
+          count_estimate: { type: Type.NUMBER },
+          notes: { type: Type.STRING },
+        },
+        required: ['label', 'count_estimate', 'notes'],
+      },
+    },
+    important_moments: {
+      type: Type.ARRAY,
+      description: 'Key timestamped moments worth human review.',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          timestamp: { type: Type.STRING, description: 'Timestamp in HH:MM:SS format.' },
+          is_approximate: { type: Type.BOOLEAN },
+          description: { type: Type.STRING },
+        },
+        required: ['timestamp', 'is_approximate', 'description'],
+      },
+    },
+    safety_observations: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: 'Evidence-based road safety, visibility, or scene observations.',
+    },
+    overall_assessment: {
+      type: Type.STRING,
+      description: 'Balanced overall safety assessment distinguishing observed facts from AI interpretation.',
+    },
+  },
+  required: [
+    'video_summary',
+    'duration_seconds',
+    'events',
+    'detected_objects',
+    'important_moments',
+    'safety_observations',
+    'overall_assessment',
+  ],
+};
+
+function buildGeminiVideoPrompt(durationSec: number, width: number, height: number, fps: number): string {
+  const maxTs = formatSecondsToTimestamp(durationSec);
+  return [
+    'You are the ROADSHADOW 2.0 Road Safety & Multimodal Video Intelligence Engine.',
+    `Analyze the attached uploaded video (duration: ${durationSec.toFixed(1)}s, resolution: ${width}x${height}, ${fps} fps).`,
+    '',
+    'CRITICAL INTEGRITY & ACCURACY RULES:',
+    '1. Analyze ONLY what is genuinely visible in this actual video. NEVER fabricate vehicles, pedestrians, incidents, or timestamps that are not visible.',
+    '2. If the video shows an empty road, calm traffic with no conflicts, or a synthetic/test video pattern, report that honestly and return an empty events array or low-risk factual observations.',
+    '3. Clearly distinguish observable visual facts from AI interpretation. Never accuse any person of a crime without clear visual evidence; describe unusual or concerning behavior objectively.',
+    `4. Every timestamp MUST be formatted as HH:MM:SS and MUST lie strictly between 00:00:00 and ${maxTs}. Set is_approximate=true whenever timing is approximate.`,
+    '5. Identify visible people, vehicles, objects, movement/activities, scene changes, interactions, near-misses or safety hazards, important moments, and overall assessment.',
+    '6. Return strictly valid JSON matching the required response schema.',
+  ].join('\n');
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function executeJobAsync(jobId: string) {
   const startedAt = Date.now();
   setTimeout(async () => {
@@ -691,236 +896,286 @@ function executeJobAsync(jobId: string) {
     if (!current || current.status === 'Cancelled') return;
 
     current.status = 'Processing';
-    current.progress = 20;
+    current.progress = 15;
+    current.stageMessage = 'Validating stored video and connecting to Gemini API...';
     current.errorMessage = undefined;
     current.warnings = [];
     current.updatedAt = new Date().toISOString();
     persistJobsSnapshot();
 
+    let uploadedGeminiFileName: string | null = null;
+    const ai = getGeminiClient();
+
     try {
+      if (!ai) {
+        current.status = 'Failed';
+        current.progress = 0;
+        current.stageMessage = 'Gemini API key is missing.';
+        current.processingTimeMs = Date.now() - startedAt;
+        current.modelVersion = 'Gemini API Not Configured';
+        current.errorMessage =
+          'GEMINI_API_KEY is not configured on the server. Set GEMINI_API_KEY in server environment variables and click Retry AI Analysis.';
+        current.warnings = ['No analysis results were created because GEMINI_API_KEY is missing.'];
+        current.updatedAt = new Date().toISOString();
+        persistJobsSnapshot();
+        structuredLog('WARN', 'processing_job_gemini_unconfigured', {
+          jobId,
+          videoId: current.videoId,
+        });
+        return;
+      }
+
       const localFile = resolveUploadedFilePath(current.fileUrl);
       if (!localFile) {
         throw new Error('Uploaded video file could not be located on server storage.');
       }
 
-      const cvServiceUrl = resolveExternalServiceUrl(process.env.CV_SERVICE_URL);
-      if (!cvServiceUrl) {
-        // Honest Real Analysis behavior: NEVER silently fabricate detections or mark Completed!
-        current.status = 'Failed';
-        current.progress = 0;
-        current.analyzedFrames = 0;
-        current.detectedObjectCount = 0;
-        current.trackingCount = 0;
-        current.conflictCount = 0;
-        current.processingTimeMs = Date.now() - startedAt;
-        current.modelVersion = 'CV Service Not Configured';
-        current.errorMessage =
-          'Real video analysis requires the external Python YOLO/ByteTrack CV service (CV_SERVICE_URL), which is not configured. Your video remains safely stored in this project and can be retried once CV_SERVICE_URL is connected.';
-        current.warnings = [
-          'No detections or conflict events were generated because no CV inference service is connected.',
-        ];
-        current.updatedAt = new Date().toISOString();
-        persistJobsSnapshot();
-        structuredLog('WARN', 'processing_job_cv_unconfigured', { jobId, videoId: current.videoId });
-        return;
+      const stat = await fs.promises.stat(localFile.fullPath);
+      if (stat.size <= 0) {
+        throw new Error('Uploaded video file is empty.');
+      }
+      if (stat.size > MAX_UPLOAD_BYTES) {
+        throw new Error(`Uploaded video exceeds the ${MAX_UPLOAD_MB} MB processing limit.`);
       }
 
-      current.progress = 40;
-      current.updatedAt = new Date().toISOString();
-      persistJobsSnapshot();
-
-      // Forward the actual uploaded video file to the external Python CV worker via multipart upload
-      // with bounded retries for transient network / 502 / 503 / 504 / 429 failures (e.g. Cloud Run cold starts).
-      const fileBuffer = await fs.promises.readFile(localFile.fullPath);
       const ext = path.extname(localFile.fileName).toLowerCase();
       const mime =
         ext === '.webm' ? 'video/webm' : ext === '.mov' ? 'video/quicktime' : 'video/mp4';
 
-      const TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
-      const maxAttempts = 1 + CV_MAX_RETRIES;
-      let workerResp: globalThis.Response | null = null;
-      let lastError: Error | null = null;
+      // Probe authoritative video metadata with ffprobe so timestamps are clamped accurately
+      const probe = await probeAndThumbnailVideo(localFile.fullPath, localFile.fileName);
+      if (!probe.valid) {
+        throw new Error(probe.error || 'Stored video file could not be decoded.');
+      }
+      const effectiveDuration =
+        probe.durationSec > 0 ? probe.durationSec : Math.max(0, current.durationSec || 0);
+      const effectiveFps = probe.fps > 0 ? probe.fps : 25;
+      current.durationSec = effectiveDuration;
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        const preCheck = jobStore.get(jobId);
-        if (!preCheck || preCheck.status === 'Cancelled') return;
+      const checkBeforeUpload = jobStore.get(jobId);
+      if (!checkBeforeUpload || checkBeforeUpload.status === 'Cancelled') return;
 
-        const form = new FormData();
-        form.append('video', new Blob([fileBuffer], { type: mime }), localFile.fileName);
-        form.append('job_id', jobId);
-        form.append('video_id', current.videoId);
-        form.append('project_id', current.projectId);
-        form.append('location_id', current.locationId);
-        form.append('owner_id', current.ownerId);
-        form.append('occurred_at_iso', current.occurredAtIso);
+      // Upload video to Gemini Files API (preferred for all video sizes); inline fallback only for small clips
+      let videoPart: unknown;
+      checkBeforeUpload.status = 'Processing';
+      checkBeforeUpload.progress = 25;
+      checkBeforeUpload.stageMessage = 'Uploading video to Gemini Files API...';
+      checkBeforeUpload.updatedAt = new Date().toISOString();
+      persistJobsSnapshot();
 
-        structuredLog('INFO', 'cv_worker_request_attempt', {
+      try {
+        structuredLog('INFO', 'gemini_files_upload_start', {
           jobId,
           videoId: current.videoId,
-          attempt,
-          maxAttempts,
-          fileSizeBytes: fileBuffer.length,
+          fileSizeBytes: stat.size,
+          mimeType: mime,
+          durationSec: effectiveDuration,
         });
 
-        try {
-          const resp = await fetch(`${cvServiceUrl}/api/v1/analyze-upload`, {
-            method: 'POST',
-            headers: process.env.CV_SERVICE_API_KEY
-              ? { Authorization: `Bearer ${process.env.CV_SERVICE_API_KEY}` }
-              : undefined,
-            body: form,
-            signal: AbortSignal.timeout(CV_TIMEOUT_MS),
-          });
-
-          if (resp.ok) {
-            workerResp = resp;
-            lastError = null;
-            break;
-          }
-
-          let detail = `External CV worker returned HTTP ${resp.status}.`;
-          try {
-            const errBody = (await resp.json()) as { detail?: string; error?: string };
-            if (errBody.detail || errBody.error) {
-              detail = String(errBody.detail || errBody.error).slice(0, 350);
-            }
-          } catch {
-            // Keep HTTP status message
-          }
-
-          lastError = new Error(detail);
-          const isTransient = TRANSIENT_STATUSES.has(resp.status);
-          structuredLog('WARN', 'cv_worker_http_error', {
-            jobId,
-            attempt,
-            status: resp.status,
-            transient: isTransient,
-            detail,
-          });
-          if (!isTransient || attempt >= maxAttempts) {
-            throw lastError;
-          }
-        } catch (fetchErr) {
-          const errObj =
-            fetchErr instanceof Error ? fetchErr : new Error('CV worker request failed.');
-          // If this was already thrown above for a non-transient HTTP status, rethrow immediately
-          if (fetchErr === lastError) {
-            throw errObj;
-          }
-          lastError = errObj;
-          structuredLog('WARN', 'cv_worker_network_error', {
-            jobId,
-            attempt,
-            maxAttempts,
-            error: errObj.message,
-          });
-          if (attempt >= maxAttempts) {
-            throw errObj;
-          }
-        }
-
-        const backoffMs = Math.min(6000, 2000 * attempt);
-        const retryState = jobStore.get(jobId);
-        if (retryState && retryState.status !== 'Cancelled') {
-          retryState.progress = Math.min(60, 40 + attempt * 8);
-          retryState.warnings = [
-            `Transient CV worker error on attempt ${attempt}/${maxAttempts}; retrying in ${backoffMs / 1000}s...`,
-          ];
-          retryState.updatedAt = new Date().toISOString();
-          persistJobsSnapshot();
-        }
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
-      }
-
-      const refreshed = jobStore.get(jobId);
-      if (!refreshed || refreshed.status === 'Cancelled') return;
-      if (!workerResp) {
-        throw lastError || new Error('External CV worker did not return a valid response.');
-      }
-
-      let rawJson: unknown;
-      try {
-        rawJson = await workerResp.json();
-      } catch {
-        throw new Error('External CV worker returned malformed non-JSON output.');
-      }
-
-      const workerJson = rawJson as {
-        model_version?: string;
-        analyzed_frames?: number;
-        processing_time_ms?: number;
-        detections?: unknown;
-        trajectories?: unknown;
-        events?: unknown;
-        warnings?: unknown;
-      };
-
-      if (
-        !workerJson ||
-        typeof workerJson !== 'object' ||
-        !Array.isArray(workerJson.detections) ||
-        !Array.isArray(workerJson.trajectories) ||
-        !Array.isArray(workerJson.events)
-      ) {
-        throw new Error(
-          'External CV worker response is missing required detections, trajectories, or events arrays.'
+        let remoteFile = await withTimeout(
+          ai.files.upload({
+            file: localFile.fullPath,
+            config: {
+              mimeType: mime,
+              displayName: localFile.fileName,
+            },
+          }),
+          Math.min(GEMINI_ANALYSIS_TIMEOUT_MS, 90000),
+          'Gemini file upload'
         );
+
+        uploadedGeminiFileName = remoteFile.name ?? null;
+
+        // Poll Gemini Files API until file state becomes ACTIVE
+        const pollDeadline = Date.now() + Math.min(GEMINI_ANALYSIS_TIMEOUT_MS, 120000);
+        while (remoteFile.state === FileState.PROCESSING || remoteFile.state === 'PROCESSING') {
+          const cancelledCheck = jobStore.get(jobId);
+          if (!cancelledCheck || cancelledCheck.status === 'Cancelled') return;
+          if (Date.now() >= pollDeadline) {
+            throw new Error('Gemini file processing timed out before becoming active.');
+          }
+          cancelledCheck.progress = Math.min(48, Math.max(30, cancelledCheck.progress + 3));
+          cancelledCheck.stageMessage = 'Waiting for Gemini to finish indexing video frames...';
+          cancelledCheck.updatedAt = new Date().toISOString();
+          persistJobsSnapshot();
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          if (!remoteFile.name) break;
+          remoteFile = await ai.files.get({ name: remoteFile.name });
+        }
+
+        if (remoteFile.state === FileState.FAILED || remoteFile.state === 'FAILED') {
+          throw new Error(
+            `Gemini file processing failed (state: FAILED)${
+              remoteFile.error?.message ? `: ${remoteFile.error.message}` : '.'
+            }`
+          );
+        }
+
+        if (!remoteFile.uri) {
+          throw new Error('Gemini Files API did not return a usable file URI.');
+        }
+
+        videoPart = createPartFromUri(remoteFile.uri, remoteFile.mimeType || mime);
+      } catch (uploadErr) {
+        // Fallback to inlineData ONLY for small files (<= 15 MB) if Files API upload fails transiently
+        const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
+        const isAuthOrQuota = /(401|403|429|api_key_invalid|quota|resource_exhausted|state: failed)/i.test(
+          errMsg
+        );
+        if (stat.size <= GEMINI_INLINE_MAX_BYTES && !isAuthOrQuota) {
+          structuredLog('WARN', 'gemini_files_upload_fallback_inline', {
+            jobId,
+            reason: errMsg.slice(0, 200),
+          });
+          const buf = await fs.promises.readFile(localFile.fullPath);
+          videoPart = {
+            inlineData: {
+              mimeType: mime,
+              data: buf.toString('base64'),
+            },
+          };
+          current.warnings.push('Used direct inline video payload for Gemini analysis.');
+        } else {
+          throw uploadErr;
+        }
       }
 
-      const detections = workerJson.detections;
-      const trajectories = workerJson.trajectories;
-      const events = workerJson.events;
+      const preAnalysisCheck = jobStore.get(jobId);
+      if (!preAnalysisCheck || preAnalysisCheck.status === 'Cancelled') return;
 
-      refreshed.status = 'Completed';
-      refreshed.progress = 100;
-      refreshed.engineMode = 'CV_SERVICE';
-      refreshed.modelVersion = workerJson.model_version || 'Ultralytics YOLO+ByteTrack';
-      refreshed.analyzedFrames = Number(workerJson.analyzed_frames || 0);
-      refreshed.detectedObjectCount = detections.length;
-      refreshed.trackingCount = trajectories.length;
-      refreshed.conflictCount = events.length;
-      refreshed.warnings = Array.isArray(workerJson.warnings)
-        ? workerJson.warnings.map((w) => String(w))
-        : [];
-      refreshed.processingTimeMs =
-        typeof workerJson.processing_time_ms === 'number' && workerJson.processing_time_ms > 0
-          ? Math.round(workerJson.processing_time_ms)
-          : Date.now() - startedAt;
-      refreshed.resultPayload = {
-        detections,
-        trajectories,
-        events,
-      };
-      refreshed.updatedAt = new Date().toISOString();
+      preAnalysisCheck.status = 'AI Analysis';
+      preAnalysisCheck.progress = 58;
+      preAnalysisCheck.stageMessage = `Running multimodal video analysis with ${GEMINI_VIDEO_MODEL}...`;
+      preAnalysisCheck.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
+
+      const prompt = buildGeminiVideoPrompt(
+        effectiveDuration,
+        probe.width,
+        probe.height,
+        effectiveFps
+      );
+
+      const remainingMs = Math.max(
+        30000,
+        GEMINI_ANALYSIS_TIMEOUT_MS - (Date.now() - startedAt)
+      );
+
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: GEMINI_VIDEO_MODEL,
+          contents: [videoPart as Parameters<typeof ai.models.generateContent>[0]['contents'], prompt] as Parameters<
+            typeof ai.models.generateContent
+          >[0]['contents'],
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: GEMINI_VIDEO_RESPONSE_SCHEMA,
+          },
+        }),
+        remainingMs,
+        'Gemini AI video analysis'
+      );
+
+      const postAnalysisCheck = jobStore.get(jobId);
+      if (!postAnalysisCheck || postAnalysisCheck.status === 'Cancelled') return;
+
+      postAnalysisCheck.status = 'Saving Results';
+      postAnalysisCheck.progress = 88;
+      postAnalysisCheck.stageMessage = 'Validating structured AI output and clamping timestamps...';
+      postAnalysisCheck.updatedAt = new Date().toISOString();
+      persistJobsSnapshot();
+
+      const geminiAnalysis = validateAndNormalizeGeminiAnalysis(response.text, {
+        durationSec: effectiveDuration,
+        modelVersion: GEMINI_VIDEO_MODEL,
+      });
+
+      const detectionsSummary = buildDetectionsSummaryFromGemini(geminiAnalysis);
+      const conflictEvents = mapGeminiAnalysisToConflictEvents(geminiAnalysis, {
+        videoId: postAnalysisCheck.videoId,
+        projectId: postAnalysisCheck.projectId,
+        locationId: postAnalysisCheck.locationId,
+        ownerId: postAnalysisCheck.ownerId,
+        fps: effectiveFps,
+        occurredAtIso: postAnalysisCheck.occurredAtIso,
+        jobId,
+      });
+
+      const videoMetadata = {
+        fps: effectiveFps,
+        width: probe.width,
+        height: probe.height,
+        resolution: `${probe.width}x${probe.height}`,
+        duration: effectiveDuration,
+      };
+
+      postAnalysisCheck.status = 'Completed';
+      postAnalysisCheck.progress = 100;
+      postAnalysisCheck.stageMessage = 'Gemini AI video analysis completed and validated.';
+      postAnalysisCheck.engineMode = 'GEMINI_AI';
+      postAnalysisCheck.modelVersion = GEMINI_VIDEO_MODEL;
+      postAnalysisCheck.analyzedFrames = Math.max(1, Math.round(effectiveDuration * effectiveFps));
+      postAnalysisCheck.detectedObjectCount = detectionsSummary.total_detections;
+      postAnalysisCheck.trackingCount = geminiAnalysis.events.length;
+      postAnalysisCheck.conflictCount = conflictEvents.length;
+      postAnalysisCheck.processingTimeMs = Date.now() - startedAt;
+      postAnalysisCheck.resultPayload = {
+        videoMetadata,
+        geminiAnalysis,
+        detectionsSummary,
+        tracks: [],
+        conflicts: [],
+        detections: [],
+        trajectories: [],
+        events: conflictEvents,
+      };
+      postAnalysisCheck.updatedAt = new Date().toISOString();
+      persistJobsSnapshot();
+
       structuredLog('INFO', 'processing_job_completed', {
         jobId,
-        engineMode: refreshed.engineMode,
-        modelVersion: refreshed.modelVersion,
-        analyzedFrames: refreshed.analyzedFrames,
-        detections: refreshed.detectedObjectCount,
-        tracks: refreshed.trackingCount,
-        conflicts: refreshed.conflictCount,
-        processingTimeMs: refreshed.processingTimeMs,
+        engineMode: postAnalysisCheck.engineMode,
+        modelVersion: postAnalysisCheck.modelVersion,
+        durationSec: effectiveDuration,
+        detectedObjects: postAnalysisCheck.detectedObjectCount,
+        timelineEvents: geminiAnalysis.events.length,
+        safetyConflictEvents: conflictEvents.length,
+        processingTimeMs: postAnalysisCheck.processingTimeMs,
       });
     } catch (err) {
       const target = jobStore.get(jobId);
       if (!target || target.status === 'Cancelled') return;
+      const classified = classifyGeminiApiError(err);
       target.status = 'Failed';
       target.progress = 0;
+      target.stageMessage = 'AI video analysis failed.';
       target.processingTimeMs = Date.now() - startedAt;
-      const rawMsg = err instanceof Error ? err.message : 'CV processing worker failed.';
-      target.errorMessage = rawMsg.includes('TimeoutError') || rawMsg.includes('aborted')
-        ? `CV processing timed out after ${Math.round(CV_TIMEOUT_MS / 1000)}s. Your uploaded video is preserved and you can retry.`
-        : rawMsg.slice(0, 500);
+      target.errorMessage = classified.userMessage;
       target.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
       structuredLog('ERROR', 'processing_job_failed', {
         jobId,
-        error: target.errorMessage,
+        videoId: target.videoId,
+        error: err instanceof Error ? err.message.slice(0, 300) : 'gemini_analysis_failed',
       });
+    } finally {
+      if (uploadedGeminiFileName && ai) {
+        try {
+          await ai.files.delete({ name: uploadedGeminiFileName });
+          structuredLog('INFO', 'gemini_temp_file_deleted', {
+            jobId,
+            fileName: uploadedGeminiFileName,
+          });
+        } catch (cleanupErr) {
+          structuredLog('WARN', 'gemini_temp_file_delete_failed', {
+            jobId,
+            fileName: uploadedGeminiFileName,
+            error: cleanupErr instanceof Error ? cleanupErr.message.slice(0, 160) : 'cleanup_failed',
+          });
+        }
+      }
     }
-  }, 180);
+  }, 150);
 }
 
 async function startServer() {
@@ -961,10 +1216,10 @@ async function startServer() {
     },
   });
 
-  // --- System & Real Active CV Health Check ---
+  // --- System & Gemini AI Video Engine Health Check ---
   app.get('/api/health', async (req, res) => {
     const force = req.query.refresh === '1';
-    const cvHealth = await probeCvWorkerHealth(force);
+    const aiHealth = await probeGeminiVideoHealth(force);
     const sumoConfigured = Boolean(resolveExternalServiceUrl(process.env.SUMO_SERVICE_URL));
     const geminiConfigured = Boolean(
       process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
@@ -973,7 +1228,8 @@ async function startServer() {
       status: 'ok',
       service: 'ROADSHADOW 2.0 API',
       maxUploadMb: MAX_UPLOAD_MB,
-      cvAdapter: cvHealth,
+      cvAdapter: aiHealth,
+      aiVideoEngine: aiHealth,
       sumoAdapter: {
         configured: sumoConfigured,
       },
@@ -1153,9 +1409,30 @@ async function startServer() {
         return;
       }
 
+      // Prevent duplicate concurrent analysis jobs for the same video
+      const existingActive = findActiveJobForVideo(data.videoId);
+      if (existingActive) {
+        res.status(409).json({
+          error: 'An AI analysis job is already running for this video.',
+          activeJobId: existingActive.id,
+          job: existingActive,
+        });
+        return;
+      }
+
+      // Per-user rate limit protecting Gemini API quota
+      const rl = checkAnalysisRateLimit(caller.uid);
+      if (!rl.allowed) {
+        res.setHeader('Retry-After', String(rl.retryAfterSec));
+        res.status(429).json({
+          error: `Too many video analysis requests. Please wait ${rl.retryAfterSec}s before starting another job.`,
+        });
+        return;
+      }
+
       const jobId = `job_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const nowIso = new Date().toISOString();
-      const cvServiceUrl = resolveExternalServiceUrl(process.env.CV_SERVICE_URL);
+      const geminiConfigured = Boolean(getGeminiClient());
 
       const job: ServerJob = {
         id: jobId,
@@ -1169,10 +1446,9 @@ async function startServer() {
         analysisMode: 'REAL',
         status: 'Queued',
         progress: 5,
-        engineMode: 'CV_SERVICE',
-        modelVersion: cvServiceUrl
-          ? 'External Python YOLO/ByteTrack Worker'
-          : 'CV Service Not Configured',
+        stageMessage: 'Queued for Gemini AI video analysis...',
+        engineMode: 'GEMINI_AI',
+        modelVersion: geminiConfigured ? GEMINI_VIDEO_MODEL : 'Gemini API Not Configured',
         analyzedFrames: 0,
         processingTimeMs: 0,
         detectedObjectCount: 0,
@@ -1237,13 +1513,14 @@ async function startServer() {
         return;
       }
       job.status = 'Cancelled';
+      job.stageMessage = 'Analysis cancelled by user.';
       job.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
       res.json({ job });
     }
   );
 
-  // Retry a Failed or Cancelled processing job without re-uploading the video
+  // Retry a Failed, Cancelled, or Completed processing job without re-uploading the video
   app.post(
     '/api/processing/jobs/:jobId/retry',
     requireAuth(['ADMINISTRATOR', 'ANALYST']),
@@ -1258,8 +1535,16 @@ async function startServer() {
         res.status(403).json({ error: 'Access denied to retry this processing job.' });
         return;
       }
-      if (job.status === 'Queued' || job.status === 'Processing') {
-        res.status(409).json({ error: 'Job is already running.' });
+      if (ACTIVE_JOB_STATUSES.has(job.status)) {
+        res.status(409).json({ error: 'Analysis job is already running.' });
+        return;
+      }
+      const otherActive = findActiveJobForVideo(job.videoId);
+      if (otherActive && otherActive.id !== job.id) {
+        res.status(409).json({
+          error: 'Another AI analysis job is already running for this video.',
+          activeJobId: otherActive.id,
+        });
         return;
       }
       if (!resolveUploadedFilePath(job.fileUrl)) {
@@ -1268,10 +1553,22 @@ async function startServer() {
         });
         return;
       }
+      const rl = checkAnalysisRateLimit(caller.uid);
+      if (!rl.allowed) {
+        res.setHeader('Retry-After', String(rl.retryAfterSec));
+        res.status(429).json({
+          error: `Too many retry requests. Please wait ${rl.retryAfterSec}s before retrying.`,
+        });
+        return;
+      }
       job.status = 'Queued';
       job.progress = 5;
+      job.stageMessage = 'Re-queued for Gemini AI video analysis...';
+      job.engineMode = 'GEMINI_AI';
+      job.modelVersion = getGeminiClient() ? GEMINI_VIDEO_MODEL : 'Gemini API Not Configured';
       job.errorMessage = undefined;
       job.warnings = [];
+      job.resultPayload = undefined;
       job.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
       executeJobAsync(job.id);
@@ -1320,46 +1617,7 @@ async function startServer() {
       }
 
       const cleanPath = streamPath.startsWith('/') ? streamPath : `/${streamPath}`;
-      const cvHealth = await probeCvWorkerHealth();
-      let liveConnected = false;
-      let probeDetail = '';
-
-      // If the external CV worker is actually reachable, actively probe the RTSP stream
-      const cvServiceUrl = resolveExternalServiceUrl(process.env.CV_SERVICE_URL);
-      if (cvHealth.status === 'available' && cvServiceUrl) {
-        try {
-          const creds =
-            hasCredentials && refId ? rtspSecretVault.get(refId) : undefined;
-          const authPrefix = creds
-            ? `${encodeURIComponent(creds.username)}:${encodeURIComponent(creds.password)}@`
-            : '';
-          const probeUrl = `${protocol}://${authPrefix}${streamHost.trim()}:${streamPort}${cleanPath}`;
-          const probeResp = await fetch(`${cvServiceUrl}/api/v1/rtsp/probe`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(process.env.CV_SERVICE_API_KEY
-                ? { Authorization: `Bearer ${process.env.CV_SERVICE_API_KEY}` }
-                : {}),
-            },
-            body: JSON.stringify({ rtsp_url: probeUrl }),
-            signal: AbortSignal.timeout(8000),
-          });
-          if (probeResp.ok) {
-            const probeJson = (await probeResp.json()) as {
-              connected?: boolean;
-              error?: string;
-            };
-            liveConnected = probeJson.connected === true;
-            if (!liveConnected && probeJson.error) {
-              probeDetail = probeJson.error;
-            }
-          }
-        } catch {
-          liveConnected = false;
-          probeDetail = 'RTSP probe timed out against external CV worker.';
-        }
-      }
+      const liveConnected = false;
 
       const cfg: RtspServerConfig = {
         cameraId,
@@ -1392,14 +1650,11 @@ async function startServer() {
         streamPort: cfg.streamPort,
         streamPath: cfg.streamPath,
         hasCredentials: cfg.hasCredentials,
-        adapterReady: cvHealth.status === 'available',
-        liveConnected,
-        connectionStatus: liveConnected ? 'Connected' : 'Not connected',
-        message: liveConnected
-          ? 'RTSP stream verified via external CV worker. Credentials stay strictly server-side.'
-          : cvHealth.status === 'available'
-            ? `RTSP parameters saved, but live stream handshake failed (${probeDetail || 'stream unreachable'}).`
-            : 'RTSP parameters validated and stored server-side, but live stream ingestion is Not connected because the external CV worker (CV_SERVICE_URL) is unavailable.',
+        adapterReady: false,
+        liveConnected: false,
+        connectionStatus: 'Not connected',
+        message:
+          'RTSP parameters validated and stored server-side. Continuous live RTSP ingestion requires a dedicated stream relay; upload recorded clips on Upload Video to run Gemini AI video analysis.',
       });
     }
   );
@@ -1407,11 +1662,10 @@ async function startServer() {
   app.get('/api/cameras/rtsp-config/:cameraId', requireAuth(), async (req, res) => {
     const caller = req.authContext!;
     const cfg = rtspConfigStore.get(`${caller.uid}:${req.params.cameraId}`);
-    const cvHealth = await probeCvWorkerHealth();
     if (!cfg) {
       res.json({
         configured: false,
-        adapterReady: cvHealth.status === 'available',
+        adapterReady: false,
         liveConnected: false,
         connectionStatus: 'Not connected',
       });
@@ -1425,12 +1679,9 @@ async function startServer() {
       streamPort: cfg.streamPort,
       streamPath: cfg.streamPath,
       hasCredentials: cfg.hasCredentials,
-      adapterReady: cvHealth.status === 'available',
-      liveConnected: cfg.lastVerifiedConnected && cvHealth.status === 'available',
-      connectionStatus:
-        cfg.lastVerifiedConnected && cvHealth.status === 'available'
-          ? 'Connected'
-          : 'Not connected',
+      adapterReady: false,
+      liveConnected: false,
+      connectionStatus: 'Not connected',
       updatedAt: cfg.updatedAt,
     });
   });

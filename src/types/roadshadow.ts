@@ -41,12 +41,15 @@ export type ProcessingStatus =
   | 'Uploading'
   | 'Uploaded'
   | 'Queued'
+  | 'Analyzing'
   | 'Processing'
+  | 'AI Analysis'
+  | 'Saving Results'
   | 'Completed'
   | 'Failed'
   | 'Cancelled';
 
-export type EngineMode = 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
+export type EngineMode = 'GEMINI_AI' | 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
 
 export type MeasurementQuality =
   | 'calibrated'
@@ -155,6 +158,126 @@ export interface TrackedTrajectory {
   directionLabel: string;
 }
 
+export interface CvTrackPoint {
+  frame: number;
+  t: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface CvTrackRecord {
+  id: string;
+  class: DetectedObjectClass | string;
+  avg_confidence: number;
+  trajectory: CvTrackPoint[];
+  speed_px_per_s: number | null;
+  direction_label?: string;
+}
+
+export interface CvConflictRecord {
+  track_a: string;
+  track_b: string;
+  types: [string, string] | string[];
+  timestamp: number;
+  ttc: number | null;
+  pet: number | null;
+  severity: 'low' | 'medium' | 'high';
+  location_xy: [number, number] | null;
+  method: string;
+}
+
+export interface CvDetectionsSummary {
+  total_detections: number;
+  by_class: Record<string, number>;
+}
+
+export interface CvVideoMetadata {
+  fps: number;
+  width: number;
+  height: number;
+  resolution: string;
+  duration: number;
+}
+
+export interface CvThresholds {
+  proximity_px?: number;
+  min_closing_speed_px_per_s?: number;
+  max_ttc_s?: number;
+  max_pet_s?: number;
+  zone_radius_px?: number;
+  severity?: {
+    high?: string;
+    medium?: string;
+    low?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export type GeminiConfidence = 'low' | 'medium' | 'high';
+export type GeminiRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+
+export interface GeminiTimelineEvent {
+  timestamp_start: string;
+  timestamp_end: string;
+  timestamp_start_sec: number;
+  timestamp_end_sec: number;
+  is_approximate: boolean;
+  event: string;
+  objects_detected: string[];
+  activity: string;
+  confidence: GeminiConfidence;
+  risk_level: GeminiRiskLevel;
+  reason: string;
+}
+
+export interface GeminiDetectedObject {
+  label: string;
+  count_estimate: number;
+  notes: string;
+}
+
+export interface GeminiImportantMoment {
+  timestamp: string;
+  timestamp_sec: number;
+  is_approximate: boolean;
+  description: string;
+}
+
+export interface GeminiVideoAnalysis {
+  video_summary: string;
+  duration_seconds: number;
+  events: GeminiTimelineEvent[];
+  detected_objects: GeminiDetectedObject[];
+  important_moments: GeminiImportantMoment[];
+  safety_observations: string[];
+  overall_assessment: string;
+  model_version: string;
+  analyzed_at: string;
+}
+
+export interface VideoAnalysisRecord {
+  id: string;
+  videoId: string;
+  projectId: string;
+  ownerId: string;
+  jobId: string;
+  modelVersion: string;
+  engineMode: EngineMode;
+  videoMetadata?: CvVideoMetadata;
+  detectionsSummary: CvDetectionsSummary;
+  geminiAnalysis?: GeminiVideoAnalysis;
+  tracks: CvTrackRecord[];
+  detections: FrameDetection[];
+  trajectories: TrackedTrajectory[];
+  conflicts: CvConflictRecord[];
+  thresholds?: CvThresholds;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface VideoRecord {
   id: string;
   projectId: string;
@@ -180,8 +303,13 @@ export interface VideoRecord {
   durationSec: number;
   status: ProcessingStatus;
   isDemonstration: boolean;
+  geminiAnalysis?: GeminiVideoAnalysis;
   detections?: FrameDetection[];
   trajectories?: TrackedTrajectory[];
+  detectionsSummary?: CvDetectionsSummary;
+  tracks?: CvTrackRecord[];
+  conflicts?: CvConflictRecord[];
+  thresholds?: CvThresholds;
   createdAt: string;
   updatedAt: string;
 }
@@ -191,8 +319,17 @@ export interface ProcessingJob {
   videoId: string;
   projectId: string;
   ownerId: string;
-  status: 'Queued' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled';
+  status:
+    | 'Queued'
+    | 'Analyzing'
+    | 'Processing'
+    | 'AI Analysis'
+    | 'Saving Results'
+    | 'Completed'
+    | 'Failed'
+    | 'Cancelled';
   progress: number;
+  stageMessage?: string;
   engineMode: EngineMode;
   modelVersion: string;
   analyzedFrames: number;
@@ -217,6 +354,9 @@ export interface ConflictEvent {
   occurredAt: string;
   conflictType: ConflictType;
   originalConflictType: ConflictType;
+  severity?: 'low' | 'medium' | 'high';
+  locationXy?: [number, number] | null;
+  detectionMethod?: string;
   riskScore: number;
   riskCategory: RiskCategory;
   detectionConfidence: number;

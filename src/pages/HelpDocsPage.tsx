@@ -140,22 +140,22 @@ export function HelpDocsPage() {
         </ul>
       </section>
 
-      {/* External Computer Vision Worker & Environment Setup */}
+      {/* Gemini AI Video Analysis Pipeline & Environment Setup */}
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-[#122943] border border-[#233B56] rounded-lg p-5 space-y-3">
           <h2 className="text-base font-semibold text-[#F5F8FC] flex items-center gap-2">
             <Cpu className="w-5 h-5 text-[#45B5FF]" aria-hidden="true" />
-            Python FastAPI CV Worker Deployment
+            Gemini AI Video Analysis Pipeline
           </h2>
           <p className="text-sm text-[#A9B8CA] leading-relaxed">
-            Current backend CV adapter mode:{' '}
-            <span className="font-mono text-[#F5F8FC]">{serverHealth.cvAdapter.mode}</span>.
-            To connect a dedicated GPU or CPU YOLO + ByteTrack worker for real-time frame decoding and multi-object tracking:
+            Current backend analysis engine:{' '}
+            <span className="font-mono text-[#F5F8FC]">{serverHealth.cvAdapter.mode}</span>{' '}
+            ({serverHealth.cvAdapter.modelVersion || 'gemini-4-hydrogen'}). Uploaded videos are analysed end-to-end on the server without any external Python service:
           </p>
           <ol className="list-decimal pl-5 space-y-1.5 text-xs text-[#A9B8CA] leading-relaxed">
-            <li>Deploy the bundled FastAPI worker service (<code className="text-[#F5F8FC]">cv_worker/main.py</code>) with Python 3.10+ and its dependencies (<code className="text-[#F5F8FC]">cv_worker/requirements.txt</code>).</li>
-            <li>Set <code className="text-[#F5F8FC]">CV_SERVICE_URL</code> (and optional <code className="text-[#F5F8FC]">CV_SERVICE_API_KEY</code>) in your server environment variables.</li>
-            <li>Restart the ROADSHADOW server. Uploaded videos will automatically route to <code className="text-[#F5F8FC]">POST /analyze</code> and return structured per-frame detections and trajectories.</li>
+            <li>Uploaded MP4, MOV, or WebM clips are validated via <code className="text-[#F5F8FC]">ffprobe</code> and stored securely on the backend.</li>
+            <li>The server uploads the stored clip to the official Gemini Files API, runs structured multimodal analysis, and deletes the temporary remote file upon completion.</li>
+            <li>Validated summaries, detected object estimates, safety observations, and duration-clamped timestamped events are saved to Cloud Firestore and displayed in Video Analysis and Dashboard views.</li>
           </ol>
         </div>
 
