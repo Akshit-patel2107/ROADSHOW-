@@ -199,8 +199,8 @@ export function DashboardPage() {
       scopedVideos
         .filter((v) => Boolean(v.geminiAnalysis))
         .sort((a, b) =>
-          (b.geminiAnalysis?.analyzed_at || b.uploadedAt).localeCompare(
-            a.geminiAnalysis?.analyzed_at || a.uploadedAt
+          (b.geminiAnalysis?.analyzed_at || b.updatedAt || b.createdAt).localeCompare(
+            a.geminiAnalysis?.analyzed_at || a.updatedAt || a.createdAt
           )
         ),
     [scopedVideos]

@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, Type, FileState, createPartFromUri } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { z } from 'zod';
 import { createServer as createViteServer } from 'vite';
 import {
@@ -19,6 +19,23 @@ import {
   validateAndNormalizeGeminiAnalysis,
   type GeminiVideoAnalysis,
 } from './src/engine/geminiVideoAnalysis';
+import {
+  deduplicateAdjacentFrames,
+  mergeSegmentAnalyses,
+  normalizeQualityMode,
+  partitionSegmentsForRetry,
+  planVideoSegments,
+  QUALITY_MODE_CONFIGS,
+  runWithBoundedConcurrency,
+  selectDetailedTargetWindows,
+  type SampledFramePayload,
+  type SegmentAnalysisResult,
+} from './src/engine/videoPipelinePlanner';
+import type {
+  AnalysisQualityMode,
+  ProcessingTimings,
+  SegmentProgressSummary,
+} from './src/types/roadshadow';
 
 const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -27,13 +44,14 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD_MB = Math.max(10, Math.min(1024, Number(process.env.MAX_UPLOAD_MB || 250)));
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const GEMINI_VIDEO_MODEL = 'gemini-4-hydrogen';
-const GEMINI_ANALYSIS_TIMEOUT_MS = Math.max(
-  30000,
-  Math.min(300000, Number(process.env.GEMINI_ANALYSIS_TIMEOUT_MS || 180000))
+const GEMINI_FAST_SCAN_MODEL = 'gemini-3.1-flash-lite';
+const GEMINI_DETAILED_MODEL = 'gemini-4-hydrogen';
+const GEMINI_VIDEO_MODEL = `${GEMINI_FAST_SCAN_MODEL} (Fast Scan) + ${GEMINI_DETAILED_MODEL} (Detailed)`;
+const GEMINI_SEGMENT_TIMEOUT_MS = Math.max(
+  15000,
+  Math.min(90000, Number(process.env.GEMINI_SEGMENT_TIMEOUT_MS || 45000))
 );
-const GEMINI_INLINE_MAX_BYTES = 15 * 1024 * 1024;
-const ANALYSIS_RATE_LIMIT_MAX = 12;
+const ANALYSIS_RATE_LIMIT_MAX = 15;
 const ANALYSIS_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const UPLOADS_DIR = path.resolve(__dirname, 'uploads');
 const THUMBNAILS_DIR = path.resolve(UPLOADS_DIR, 'thumbnails');
@@ -520,7 +538,7 @@ async function probeGeminiVideoHealth(forceRefresh = false): Promise<AiVideoHeal
 
   const t0 = Date.now();
   try {
-    // Lightweight server-side connectivity check (lists at most 1 temporary file metadata record)
+    // Lightweight server-side connectivity check
     if (forceRefresh) {
       await ai.files.list({ config: { pageSize: 1 } });
     }
@@ -531,15 +549,15 @@ async function probeGeminiVideoHealth(forceRefresh = false): Promise<AiVideoHeal
       externalWorkerConfigured: true,
       workerReachable: true,
       rtspIngestionReady: false,
-      modelVersion: GEMINI_VIDEO_MODEL,
-      tracker: 'Gemini Multimodal Video Understanding',
+      modelVersion: GEMINI_FAST_SCAN_MODEL,
+      tracker: `Two-Stage AI (${GEMINI_FAST_SCAN_MODEL} Fast Scan + ${GEMINI_DETAILED_MODEL} Detailed)`,
       device: 'Google Gemini API (Server-Side)',
       sampleFps: null,
       classes: ['person', 'car', 'motorcycle', 'bicycle', 'bus', 'truck', 'scooter', 'auto_rickshaw'],
       asyncJobsSupported: true,
       supportedFormats,
       latencyMs,
-      message: `Gemini multimodal video analysis (${GEMINI_VIDEO_MODEL}) is configured and ready on the backend.`,
+      message: `Optimized two-stage Gemini video analysis (${GEMINI_FAST_SCAN_MODEL} Fast Scan + selective ${GEMINI_DETAILED_MODEL} Detailed) is ready on the backend.`,
       checkedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -550,8 +568,8 @@ async function probeGeminiVideoHealth(forceRefresh = false): Promise<AiVideoHeal
       externalWorkerConfigured: true,
       workerReachable: false,
       rtspIngestionReady: false,
-      modelVersion: GEMINI_VIDEO_MODEL,
-      tracker: 'Gemini Multimodal Video Understanding',
+      modelVersion: GEMINI_FAST_SCAN_MODEL,
+      tracker: `Two-Stage AI (${GEMINI_FAST_SCAN_MODEL} + ${GEMINI_DETAILED_MODEL})`,
       device: 'Google Gemini API (Server-Side)',
       sampleFps: null,
       classes: null,
@@ -570,6 +588,9 @@ async function probeGeminiVideoHealth(forceRefresh = false): Promise<AiVideoHeal
 // --- Per-User Rate Limiting & Duplicate Job Guard ---
 const ACTIVE_JOB_STATUSES = new Set([
   'Queued',
+  'Preparing Video',
+  'Fast Scan',
+  'Detailed Analysis',
   'Analyzing',
   'Processing',
   'AI Analysis',
@@ -592,7 +613,7 @@ function checkAnalysisRateLimit(uid: string): { allowed: boolean; retryAfterSec:
   return { allowed: true, retryAfterSec: 0 };
 }
 
-// --- Asynchronous Processing Job Store & File Ownership Metadata ---
+// --- Asynchronous Processing Job Store, Content Cache & File Ownership Metadata ---
 interface ServerJob {
   id: string;
   videoId: string;
@@ -603,8 +624,13 @@ interface ServerJob {
   durationSec: number;
   occurredAtIso: string;
   analysisMode: 'REAL' | 'DEMO_SAMPLE';
+  analysisQuality: AnalysisQualityMode;
+  forceRefresh?: boolean;
   status:
     | 'Queued'
+    | 'Preparing Video'
+    | 'Fast Scan'
+    | 'Detailed Analysis'
     | 'Analyzing'
     | 'Processing'
     | 'AI Analysis'
@@ -614,6 +640,9 @@ interface ServerJob {
     | 'Cancelled';
   progress: number;
   stageMessage?: string;
+  segments?: SegmentProgressSummary[];
+  segmentResultsCache?: Record<number, SegmentAnalysisResult>;
+  timings?: ProcessingTimings;
   engineMode: 'GEMINI_AI' | 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
   modelVersion: string;
   analyzedFrames: number;
@@ -647,10 +676,30 @@ interface ServerJob {
   updatedAt: string;
 }
 
+interface CachedVideoAnalysisEntry {
+  cacheKey: string;
+  qualityMode: AnalysisQualityMode;
+  modelVersion: string;
+  videoMetadata: {
+    fps: number;
+    width: number;
+    height: number;
+    resolution: string;
+    duration: number;
+  };
+  geminiAnalysis: GeminiVideoAnalysis;
+  framesAnalyzed: number;
+  segmentsTotal: number;
+  detailedMomentsRefined: number;
+  cachedAt: string;
+}
+
 const JOBS_FILE = path.resolve(UPLOADS_DIR, 'jobs.json');
 const FILE_OWNERS_FILE = path.resolve(UPLOADS_DIR, 'file_owners.json');
+const ANALYSIS_CACHE_FILE = path.resolve(UPLOADS_DIR, 'analysis_cache.json');
 const jobStore = new Map<string, ServerJob>();
 const fileOwnerMap = new Map<string, string>();
+const analysisCache = new Map<string, CachedVideoAnalysisEntry>();
 
 // Server-side-only in-memory RTSP credential vault (keyed by ownerUid:cameraId, NEVER exposed to browser)
 interface RtspServerConfig {
@@ -694,6 +743,22 @@ function loadPersistedState() {
   } catch {
     // Ignore malformed file owner cache
   }
+  try {
+    if (fs.existsSync(ANALYSIS_CACHE_FILE)) {
+      const parsed = JSON.parse(
+        fs.readFileSync(ANALYSIS_CACHE_FILE, 'utf8')
+      ) as CachedVideoAnalysisEntry[];
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed.slice(-30)) {
+          if (entry && typeof entry.cacheKey === 'string' && entry.geminiAnalysis) {
+            analysisCache.set(entry.cacheKey, entry);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed analysis cache
+  }
 }
 
 function persistJobsSnapshot() {
@@ -701,7 +766,7 @@ function persistJobsSnapshot() {
     const compact = Array.from(jobStore.values())
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 60)
-      .map(({ resultPayload: _omit, ...rest }) => rest);
+      .map(({ resultPayload: _omit, segmentResultsCache: _omitSegs, ...rest }) => rest);
     fs.writeFileSync(JOBS_FILE, JSON.stringify(compact, null, 2), 'utf8');
   } catch {
     // Non-fatal
@@ -716,6 +781,27 @@ function persistFileOwners() {
   } catch {
     // Non-fatal
   }
+}
+
+function persistAnalysisCache() {
+  try {
+    const recent = Array.from(analysisCache.values())
+      .sort((a, b) => b.cachedAt.localeCompare(a.cachedAt))
+      .slice(0, 30);
+    fs.writeFileSync(ANALYSIS_CACHE_FILE, JSON.stringify(recent, null, 2), 'utf8');
+  } catch {
+    // Non-fatal
+  }
+}
+
+async function computeFileSha256(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
 }
 
 loadPersistedState();
@@ -857,19 +943,84 @@ const GEMINI_VIDEO_RESPONSE_SCHEMA = {
   ],
 };
 
-function buildGeminiVideoPrompt(durationSec: number, width: number, height: number, fps: number): string {
-  const maxTs = formatSecondsToTimestamp(durationSec);
+const GEMINI_DETAILED_MOMENT_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    refined_event: {
+      type: Type.STRING,
+      description: 'Refined factual description of the sequence of events observed in these closer frames.',
+    },
+    refined_activity: {
+      type: Type.STRING,
+      description: 'Specific motion/interaction observed.',
+    },
+    refined_risk_level: {
+      type: Type.STRING,
+      description: 'Updated risk level: low, medium, high, or critical.',
+    },
+    refined_confidence: {
+      type: Type.STRING,
+      description: 'Confidence level: low, medium, or high.',
+    },
+    detailed_reason: {
+      type: Type.STRING,
+      description: 'Clear visual evidence explaining why this moment is flagged or benign.',
+    },
+    safety_note: {
+      type: Type.STRING,
+      description: 'Optional concise safety observation for road engineers (empty string if none).',
+    },
+  },
+  required: [
+    'refined_event',
+    'refined_activity',
+    'refined_risk_level',
+    'refined_confidence',
+    'detailed_reason',
+    'safety_note',
+  ],
+};
+
+function buildFastScanSegmentPrompt(opts: {
+  segmentIndex: number;
+  segmentsTotal: number;
+  startSec: number;
+  endSec: number;
+  totalDurationSec: number;
+  frameLabels: string[];
+  qualityMode: AnalysisQualityMode;
+}): string {
+  const startTs = formatSecondsToTimestamp(opts.startSec);
+  const endTs = formatSecondsToTimestamp(opts.endSec);
+  const conciseHint =
+    opts.qualityMode === 'fast'
+      ? 'Keep descriptions ultra-concise (1 short sentence per field). Report major events only.'
+      : 'Keep descriptions concise and factual (1-2 short sentences per field).';
   return [
-    'You are the ROADSHADOW 2.0 Road Safety & Multimodal Video Intelligence Engine.',
-    `Analyze the attached uploaded video (duration: ${durationSec.toFixed(1)}s, resolution: ${width}x${height}, ${fps} fps).`,
-    '',
-    'CRITICAL INTEGRITY & ACCURACY RULES:',
-    '1. Analyze ONLY what is genuinely visible in this actual video. NEVER fabricate vehicles, pedestrians, incidents, or timestamps that are not visible.',
-    '2. If the video shows an empty road, calm traffic with no conflicts, or a synthetic/test video pattern, report that honestly and return an empty events array or low-risk factual observations.',
-    '3. Clearly distinguish observable visual facts from AI interpretation. Never accuse any person of a crime without clear visual evidence; describe unusual or concerning behavior objectively.',
-    `4. Every timestamp MUST be formatted as HH:MM:SS and MUST lie strictly between 00:00:00 and ${maxTs}. Set is_approximate=true whenever timing is approximate.`,
-    '5. Identify visible people, vehicles, objects, movement/activities, scene changes, interactions, near-misses or safety hazards, important moments, and overall assessment.',
-    '6. Return strictly valid JSON matching the required response schema.',
+    `ROADSHADOW Fast Scan — Segment ${opts.segmentIndex + 1}/${opts.segmentsTotal} (${startTs}–${endTs} of ${formatSecondsToTimestamp(opts.totalDurationSec)}).`,
+    `Attached frames are ordered chronologically with exact original-video timestamps: ${opts.frameLabels.join(', ')}.`,
+    'Rules:',
+    '1. Report ONLY what is genuinely visible in the attached frames. Never fabricate vehicles, people, or incidents.',
+    '2. If frames show calm traffic, an empty scene, or a synthetic/test pattern, say so honestly and return an empty events array or low-risk factual notes.',
+    `3. Use exact original-video HH:MM:SS timestamps strictly inside ${startTs}–${endTs}. Set is_approximate=true when timing between sampled frames is approximate.`,
+    '4. Separate observable visual facts from AI interpretation. Never accuse anyone of intent or crime without clear visual evidence.',
+    `5. ${conciseHint}`,
+    'Return valid JSON matching the schema.',
+  ].join('\n');
+}
+
+function buildDetailedMomentPrompt(opts: {
+  windowStartSec: number;
+  windowEndSec: number;
+  initialEvent: string;
+  initialReason: string;
+  frameLabels: string[];
+}): string {
+  return [
+    `ROADSHADOW Detailed Analysis — Window ${formatSecondsToTimestamp(opts.windowStartSec)}–${formatSecondsToTimestamp(opts.windowEndSec)}.`,
+    `Fast Scan flagged: "${opts.initialEvent}" (initial note: "${opts.initialReason}").`,
+    `Closer frames attached at exact timestamps: ${opts.frameLabels.join(', ')}.`,
+    'Verify the sequence of interactions across these closer frames. Confirm or downgrade risk honestly based strictly on visible evidence. Keep response concise and factual.',
   ].join('\n');
 }
 
@@ -889,21 +1040,140 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
+function toThinkingLevel(level: 'MINIMAL' | 'LOW' | 'MEDIUM'): ThinkingLevel {
+  if (level === 'MINIMAL') return ThinkingLevel.MINIMAL;
+  if (level === 'MEDIUM') return ThinkingLevel.MEDIUM;
+  return ThinkingLevel.LOW;
+}
+
+/**
+ * Extracts downscaled JPEG keyframes directly from the stored local video via fast input seeking (-ss before -i).
+ * Streams JPEG buffers in memory with zero temp files and deduplicates near-identical consecutive frames.
+ */
+async function extractSampledFrames(
+  videoPath: string,
+  timestampsSec: number[],
+  widthPx: number,
+  jpegQuality: number
+): Promise<SampledFramePayload[]> {
+  const rawFrames = await runWithBoundedConcurrency(timestampsSec, 4, async (ts) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-ss',
+          ts.toFixed(2),
+          '-i',
+          videoPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          `scale='min(${widthPx},iw)':-2`,
+          '-q:v',
+          String(jpegQuality),
+          '-f',
+          'image2pipe',
+          '-vcodec',
+          'mjpeg',
+          'pipe:1',
+        ],
+        {
+          encoding: 'buffer',
+          maxBuffer: 4 * 1024 * 1024,
+          timeout: 12000,
+        }
+      );
+      if (!stdout || stdout.length < 256) return null;
+      return {
+        timestampSec: ts,
+        timestampLabel: formatSecondsToTimestamp(ts),
+        base64Jpeg: stdout.toString('base64'),
+        byteLength: stdout.length,
+      } satisfies SampledFramePayload;
+    } catch {
+      return null;
+    }
+  });
+
+  const valid = rawFrames
+    .filter((f): f is SampledFramePayload => f !== null)
+    .sort((a, b) => a.timestampSec - b.timestampSec);
+
+  return deduplicateAdjacentFrames(valid);
+}
+
+/**
+ * Executes a Gemini generateContent call with timeout and exponential backoff + jitter for transient errors.
+ */
+async function callGeminiWithBackoff<T>(
+  label: string,
+  timeoutMs: number,
+  fn: () => Promise<T>,
+  maxRetries = 2
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await withTimeout(fn(), timeoutMs, label);
+    } catch (err) {
+      lastErr = err;
+      const classified = classifyGeminiApiError(err);
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      const isAuthOrBadInput =
+        !classified.retryable || /(api_key_invalid|permission_denied|401|403|not_found|404)/i.test(rawMsg);
+      if (isAuthOrBadInput || attempt === maxRetries) {
+        throw err;
+      }
+      const delayMs = 1100 * Math.pow(2, attempt) + Math.floor(Math.random() * 450);
+      structuredLog('WARN', 'gemini_call_retry_backoff', {
+        label,
+        attempt: attempt + 1,
+        delayMs,
+        reason: rawMsg.slice(0, 180),
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+function buildFrameParts(frames: SampledFramePayload[], prompt: string) {
+  const parts: Array<
+    { text: string } | { inlineData: { mimeType: string; data: string } }
+  > = [];
+  for (const frame of frames) {
+    parts.push({ text: `Frame at ${frame.timestampLabel} (${frame.timestampSec.toFixed(1)}s):` });
+    parts.push({
+      inlineData: {
+        mimeType: 'image/jpeg',
+        data: frame.base64Jpeg,
+      },
+    });
+  }
+  parts.push({ text: prompt });
+  return { parts };
+}
+
 function executeJobAsync(jobId: string) {
   const startedAt = Date.now();
   setTimeout(async () => {
     const current = jobStore.get(jobId);
     if (!current || current.status === 'Cancelled') return;
 
-    current.status = 'Processing';
-    current.progress = 15;
-    current.stageMessage = 'Validating stored video and connecting to Gemini API...';
+    const qualityMode = normalizeQualityMode(current.analysisQuality);
+    const cfg = QUALITY_MODE_CONFIGS[qualityMode];
+
+    current.status = 'Preparing Video';
+    current.progress = 8;
+    current.stageMessage = `Preparing stored video (${cfg.label} mode)...`;
     current.errorMessage = undefined;
     current.warnings = [];
     current.updatedAt = new Date().toISOString();
     persistJobsSnapshot();
 
-    let uploadedGeminiFileName: string | null = null;
     const ai = getGeminiClient();
 
     try {
@@ -938,168 +1208,18 @@ function executeJobAsync(jobId: string) {
         throw new Error(`Uploaded video exceeds the ${MAX_UPLOAD_MB} MB processing limit.`);
       }
 
-      const ext = path.extname(localFile.fileName).toLowerCase();
-      const mime =
-        ext === '.webm' ? 'video/webm' : ext === '.mov' ? 'video/quicktime' : 'video/mp4';
-
-      // Probe authoritative video metadata with ffprobe so timestamps are clamped accurately
-      const probe = await probeAndThumbnailVideo(localFile.fullPath, localFile.fileName);
+      const prepStart = Date.now();
+      const [probe, fileHash] = await Promise.all([
+        probeAndThumbnailVideo(localFile.fullPath, localFile.fileName),
+        computeFileSha256(localFile.fullPath),
+      ]);
       if (!probe.valid) {
         throw new Error(probe.error || 'Stored video file could not be decoded.');
       }
       const effectiveDuration =
-        probe.durationSec > 0 ? probe.durationSec : Math.max(0, current.durationSec || 0);
+        probe.durationSec > 0 ? probe.durationSec : Math.max(1, current.durationSec || 1);
       const effectiveFps = probe.fps > 0 ? probe.fps : 25;
       current.durationSec = effectiveDuration;
-
-      const checkBeforeUpload = jobStore.get(jobId);
-      if (!checkBeforeUpload || checkBeforeUpload.status === 'Cancelled') return;
-
-      // Upload video to Gemini Files API (preferred for all video sizes); inline fallback only for small clips
-      let videoPart: unknown;
-      checkBeforeUpload.status = 'Processing';
-      checkBeforeUpload.progress = 25;
-      checkBeforeUpload.stageMessage = 'Uploading video to Gemini Files API...';
-      checkBeforeUpload.updatedAt = new Date().toISOString();
-      persistJobsSnapshot();
-
-      try {
-        structuredLog('INFO', 'gemini_files_upload_start', {
-          jobId,
-          videoId: current.videoId,
-          fileSizeBytes: stat.size,
-          mimeType: mime,
-          durationSec: effectiveDuration,
-        });
-
-        let remoteFile = await withTimeout(
-          ai.files.upload({
-            file: localFile.fullPath,
-            config: {
-              mimeType: mime,
-              displayName: localFile.fileName,
-            },
-          }),
-          Math.min(GEMINI_ANALYSIS_TIMEOUT_MS, 90000),
-          'Gemini file upload'
-        );
-
-        uploadedGeminiFileName = remoteFile.name ?? null;
-
-        // Poll Gemini Files API until file state becomes ACTIVE
-        const pollDeadline = Date.now() + Math.min(GEMINI_ANALYSIS_TIMEOUT_MS, 120000);
-        while (remoteFile.state === FileState.PROCESSING || remoteFile.state === 'PROCESSING') {
-          const cancelledCheck = jobStore.get(jobId);
-          if (!cancelledCheck || cancelledCheck.status === 'Cancelled') return;
-          if (Date.now() >= pollDeadline) {
-            throw new Error('Gemini file processing timed out before becoming active.');
-          }
-          cancelledCheck.progress = Math.min(48, Math.max(30, cancelledCheck.progress + 3));
-          cancelledCheck.stageMessage = 'Waiting for Gemini to finish indexing video frames...';
-          cancelledCheck.updatedAt = new Date().toISOString();
-          persistJobsSnapshot();
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-          if (!remoteFile.name) break;
-          remoteFile = await ai.files.get({ name: remoteFile.name });
-        }
-
-        if (remoteFile.state === FileState.FAILED || remoteFile.state === 'FAILED') {
-          throw new Error(
-            `Gemini file processing failed (state: FAILED)${
-              remoteFile.error?.message ? `: ${remoteFile.error.message}` : '.'
-            }`
-          );
-        }
-
-        if (!remoteFile.uri) {
-          throw new Error('Gemini Files API did not return a usable file URI.');
-        }
-
-        videoPart = createPartFromUri(remoteFile.uri, remoteFile.mimeType || mime);
-      } catch (uploadErr) {
-        // Fallback to inlineData ONLY for small files (<= 15 MB) if Files API upload fails transiently
-        const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
-        const isAuthOrQuota = /(401|403|429|api_key_invalid|quota|resource_exhausted|state: failed)/i.test(
-          errMsg
-        );
-        if (stat.size <= GEMINI_INLINE_MAX_BYTES && !isAuthOrQuota) {
-          structuredLog('WARN', 'gemini_files_upload_fallback_inline', {
-            jobId,
-            reason: errMsg.slice(0, 200),
-          });
-          const buf = await fs.promises.readFile(localFile.fullPath);
-          videoPart = {
-            inlineData: {
-              mimeType: mime,
-              data: buf.toString('base64'),
-            },
-          };
-          current.warnings.push('Used direct inline video payload for Gemini analysis.');
-        } else {
-          throw uploadErr;
-        }
-      }
-
-      const preAnalysisCheck = jobStore.get(jobId);
-      if (!preAnalysisCheck || preAnalysisCheck.status === 'Cancelled') return;
-
-      preAnalysisCheck.status = 'AI Analysis';
-      preAnalysisCheck.progress = 58;
-      preAnalysisCheck.stageMessage = `Running multimodal video analysis with ${GEMINI_VIDEO_MODEL}...`;
-      preAnalysisCheck.updatedAt = new Date().toISOString();
-      persistJobsSnapshot();
-
-      const prompt = buildGeminiVideoPrompt(
-        effectiveDuration,
-        probe.width,
-        probe.height,
-        effectiveFps
-      );
-
-      const remainingMs = Math.max(
-        30000,
-        GEMINI_ANALYSIS_TIMEOUT_MS - (Date.now() - startedAt)
-      );
-
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model: GEMINI_VIDEO_MODEL,
-          contents: [videoPart as Parameters<typeof ai.models.generateContent>[0]['contents'], prompt] as Parameters<
-            typeof ai.models.generateContent
-          >[0]['contents'],
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: GEMINI_VIDEO_RESPONSE_SCHEMA,
-          },
-        }),
-        remainingMs,
-        'Gemini AI video analysis'
-      );
-
-      const postAnalysisCheck = jobStore.get(jobId);
-      if (!postAnalysisCheck || postAnalysisCheck.status === 'Cancelled') return;
-
-      postAnalysisCheck.status = 'Saving Results';
-      postAnalysisCheck.progress = 88;
-      postAnalysisCheck.stageMessage = 'Validating structured AI output and clamping timestamps...';
-      postAnalysisCheck.updatedAt = new Date().toISOString();
-      persistJobsSnapshot();
-
-      const geminiAnalysis = validateAndNormalizeGeminiAnalysis(response.text, {
-        durationSec: effectiveDuration,
-        modelVersion: GEMINI_VIDEO_MODEL,
-      });
-
-      const detectionsSummary = buildDetectionsSummaryFromGemini(geminiAnalysis);
-      const conflictEvents = mapGeminiAnalysisToConflictEvents(geminiAnalysis, {
-        videoId: postAnalysisCheck.videoId,
-        projectId: postAnalysisCheck.projectId,
-        locationId: postAnalysisCheck.locationId,
-        ownerId: postAnalysisCheck.ownerId,
-        fps: effectiveFps,
-        occurredAtIso: postAnalysisCheck.occurredAtIso,
-        jobId,
-      });
 
       const videoMetadata = {
         fps: effectiveFps,
@@ -1109,19 +1229,547 @@ function executeJobAsync(jobId: string) {
         duration: effectiveDuration,
       };
 
-      postAnalysisCheck.status = 'Completed';
-      postAnalysisCheck.progress = 100;
-      postAnalysisCheck.stageMessage = 'Gemini AI video analysis completed and validated.';
-      postAnalysisCheck.engineMode = 'GEMINI_AI';
-      postAnalysisCheck.modelVersion = GEMINI_VIDEO_MODEL;
-      postAnalysisCheck.analyzedFrames = Math.max(1, Math.round(effectiveDuration * effectiveFps));
-      postAnalysisCheck.detectedObjectCount = detectionsSummary.total_detections;
-      postAnalysisCheck.trackingCount = geminiAnalysis.events.length;
-      postAnalysisCheck.conflictCount = conflictEvents.length;
-      postAnalysisCheck.processingTimeMs = Date.now() - startedAt;
-      postAnalysisCheck.resultPayload = {
+      // Check reusable content-hash cache unless user explicitly forced a fresh re-run
+      const cacheKey = `${fileHash}:${qualityMode}`;
+      const cached = !current.forceRefresh ? analysisCache.get(cacheKey) : undefined;
+      if (cached) {
+        const mergeStart = Date.now();
+        const cachedAnalysis: GeminiVideoAnalysis = {
+          ...cached.geminiAnalysis,
+          duration_seconds: effectiveDuration,
+        };
+        const detectionsSummary = buildDetectionsSummaryFromGemini(cachedAnalysis);
+        const conflictEvents = mapGeminiAnalysisToConflictEvents(cachedAnalysis, {
+          videoId: current.videoId,
+          projectId: current.projectId,
+          locationId: current.locationId,
+          ownerId: current.ownerId,
+          fps: effectiveFps,
+          occurredAtIso: current.occurredAtIso,
+          jobId,
+        });
+        const totalMs = Date.now() - startedAt;
+        const mergeMs = Date.now() - mergeStart;
+
+        current.status = 'Completed';
+        current.progress = 100;
+        current.stageMessage = `Completed instantly from verified cache (${cfg.label} mode).`;
+        current.engineMode = 'GEMINI_AI';
+        current.modelVersion = cached.modelVersion;
+        current.analyzedFrames = cached.framesAnalyzed;
+        current.detectedObjectCount = detectionsSummary.total_detections;
+        current.trackingCount = cachedAnalysis.events.length;
+        current.conflictCount = conflictEvents.length;
+        current.processingTimeMs = totalMs;
+        current.warnings = [
+          'Reused validated Gemini analysis result for identical video content (click Re-run AI Analysis to force a fresh pass).',
+        ];
+        current.timings = {
+          preparationMs: Date.now() - prepStart,
+          fastScanMs: 0,
+          detailedAnalysisMs: 0,
+          mergeMs,
+          totalMs,
+          cacheHit: true,
+          framesAnalyzed: cached.framesAnalyzed,
+          segmentsTotal: cached.segmentsTotal,
+          segmentsCompleted: cached.segmentsTotal,
+          segmentsFailed: 0,
+          detailedMomentsRefined: cached.detailedMomentsRefined,
+        };
+        current.resultPayload = {
+          videoMetadata,
+          geminiAnalysis: cachedAnalysis,
+          detectionsSummary,
+          tracks: [],
+          conflicts: [],
+          detections: [],
+          trajectories: [],
+          events: conflictEvents,
+        };
+        current.updatedAt = new Date().toISOString();
+        persistJobsSnapshot();
+        structuredLog('INFO', 'processing_job_cache_hit', {
+          jobId,
+          videoId: current.videoId,
+          qualityMode,
+          totalMs,
+        });
+        return;
+      }
+
+      // Plan smart video segments and check if completed segments from a previous failed attempt can be preserved
+      const plannedSegments = planVideoSegments(effectiveDuration, qualityMode);
+      const { reusedIndices, pendingIndices } = partitionSegmentsForRetry(
+        current.segments,
+        plannedSegments
+      );
+      const preservedCache = current.segmentResultsCache ?? {};
+      const reusableSet = new Set(
+        reusedIndices.filter((idx) => Boolean(preservedCache[idx]?.analysis))
+      );
+
+      const segmentSummaries: SegmentProgressSummary[] = plannedSegments.map((seg) => {
+        if (reusableSet.has(seg.segmentIndex)) {
+          const prev = current.segments?.[seg.segmentIndex];
+          return {
+            segmentIndex: seg.segmentIndex,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            status: 'completed',
+            framesSent: prev?.framesSent ?? seg.sampleTimestampsSec.length,
+            prepMs: prev?.prepMs ?? 0,
+            modelMs: prev?.modelMs ?? 0,
+          };
+        }
+        return {
+          segmentIndex: seg.segmentIndex,
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          status: 'pending',
+        };
+      });
+
+      const segmentResultsMap: Record<number, SegmentAnalysisResult> = {};
+      for (const idx of reusableSet) {
+        segmentResultsMap[idx] = preservedCache[idx];
+      }
+
+      current.segments = segmentSummaries;
+      current.segmentResultsCache = segmentResultsMap;
+      current.status = 'Fast Scan';
+      const initialDone = reusableSet.size;
+      current.progress = Math.min(
+        75,
+        15 + Math.round((initialDone / Math.max(1, plannedSegments.length)) * 60)
+      );
+      current.stageMessage =
+        reusableSet.size > 0
+          ? `Resuming Fast Scan (${reusableSet.size}/${plannedSegments.length} segments preserved; retrying ${pendingIndices.length})...`
+          : plannedSegments.length === 1
+            ? `Fast Scan (${cfg.fastScanModel}): extracting keyframes & analysing clip...`
+            : `Fast Scan (${cfg.fastScanModel}): processing ${plannedSegments.length} segments (max ${cfg.maxConcurrency} concurrent)...`;
+      current.updatedAt = new Date().toISOString();
+      persistJobsSnapshot();
+
+      let totalPrepMs = Date.now() - prepStart;
+      let totalFastScanMs = 0;
+      let totalFramesAnalyzed = Array.from(reusableSet).reduce(
+        (sum, idx) => sum + (segmentSummaries[idx].framesSent ?? 0),
+        0
+      );
+
+      const pendingSegments = plannedSegments.filter((seg) => !reusableSet.has(seg.segmentIndex));
+      const fastScanStartWall = Date.now();
+
+      await runWithBoundedConcurrency(pendingSegments, cfg.maxConcurrency, async (seg) => {
+        const liveJob = jobStore.get(jobId);
+        if (!liveJob || liveJob.status === 'Cancelled') return;
+
+        segmentSummaries[seg.segmentIndex] = {
+          ...segmentSummaries[seg.segmentIndex],
+          status: 'processing',
+          errorMessage: undefined,
+        };
+        liveJob.stageMessage =
+          plannedSegments.length === 1
+            ? `Fast Scan: sampling & analysing frames (${formatSecondsToTimestamp(seg.startSec)}–${formatSecondsToTimestamp(seg.endSec)})...`
+            : `Fast Scan: segment ${seg.segmentIndex + 1}/${plannedSegments.length} (${formatSecondsToTimestamp(seg.startSec)}–${formatSecondsToTimestamp(seg.endSec)})...`;
+        liveJob.updatedAt = new Date().toISOString();
+        persistJobsSnapshot();
+
+        const segPrepT0 = Date.now();
+        try {
+          const frames = await extractSampledFrames(
+            localFile.fullPath,
+            seg.sampleTimestampsSec,
+            cfg.frameWidthPx,
+            cfg.jpegQuality
+          );
+          const segPrepMs = Date.now() - segPrepT0;
+          totalPrepMs += segPrepMs;
+
+          if (frames.length === 0) {
+            throw new Error(
+              `Could not extract readable video frames for segment ${seg.segmentIndex + 1} (${formatSecondsToTimestamp(seg.startSec)}–${formatSecondsToTimestamp(seg.endSec)}).`
+            );
+          }
+
+          const segPrompt = buildFastScanSegmentPrompt({
+            segmentIndex: seg.segmentIndex,
+            segmentsTotal: plannedSegments.length,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            totalDurationSec: effectiveDuration,
+            frameLabels: frames.map((f) => f.timestampLabel),
+            qualityMode,
+          });
+
+          const segModelT0 = Date.now();
+          const response = await callGeminiWithBackoff(
+            `Gemini Fast Scan segment ${seg.segmentIndex + 1}`,
+            GEMINI_SEGMENT_TIMEOUT_MS,
+            async () =>
+              ai.models.generateContent({
+                model: cfg.fastScanModel,
+                contents: buildFrameParts(frames, segPrompt),
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: GEMINI_VIDEO_RESPONSE_SCHEMA,
+                  thinkingConfig: {
+                    thinkingLevel: toThinkingLevel(cfg.fastScanThinkingLevel),
+                  },
+                },
+              })
+          );
+          const segModelMs = Date.now() - segModelT0;
+
+          const segAnalysis = validateAndNormalizeGeminiAnalysis(response.text, {
+            durationSec: effectiveDuration,
+            modelVersion: cfg.fastScanModel,
+          });
+
+          segmentResultsMap[seg.segmentIndex] = {
+            segmentIndex: seg.segmentIndex,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            analysis: segAnalysis,
+          };
+          totalFramesAnalyzed += frames.length;
+          segmentSummaries[seg.segmentIndex] = {
+            segmentIndex: seg.segmentIndex,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            status: 'completed',
+            framesSent: frames.length,
+            prepMs: segPrepMs,
+            modelMs: segModelMs,
+          };
+
+          structuredLog('INFO', 'gemini_segment_completed', {
+            jobId,
+            segmentIndex: seg.segmentIndex,
+            range: `${seg.startSec}-${seg.endSec}s`,
+            framesSent: frames.length,
+            prepMs: segPrepMs,
+            modelMs: segModelMs,
+            eventsFound: segAnalysis.events.length,
+          });
+
+          // Progressive result merge so UI sees partial completed results immediately
+          const postSegJob = jobStore.get(jobId);
+          if (postSegJob && postSegJob.status !== 'Cancelled') {
+            const doneCount = segmentSummaries.filter((s) => s.status === 'completed').length;
+            postSegJob.progress = Math.min(
+              75,
+              15 + Math.round((doneCount / Math.max(1, plannedSegments.length)) * 60)
+            );
+            const partialMerged = mergeSegmentAnalyses(Object.values(segmentResultsMap), {
+              totalDurationSec: effectiveDuration,
+              modelVersion: cfg.fastScanModel,
+            });
+            postSegJob.resultPayload = {
+              videoMetadata,
+              geminiAnalysis: partialMerged,
+              detectionsSummary: buildDetectionsSummaryFromGemini(partialMerged),
+              tracks: [],
+              conflicts: [],
+              detections: [],
+              trajectories: [],
+              events: [],
+            };
+            postSegJob.analyzedFrames = totalFramesAnalyzed;
+            postSegJob.updatedAt = new Date().toISOString();
+            persistJobsSnapshot();
+          }
+        } catch (segErr) {
+          const classified = classifyGeminiApiError(segErr);
+          const rawReason = segErr instanceof Error ? segErr.message : String(segErr);
+          segmentSummaries[seg.segmentIndex] = {
+            ...segmentSummaries[seg.segmentIndex],
+            status: 'failed',
+            prepMs: Date.now() - segPrepT0,
+            errorMessage: classified.userMessage,
+          };
+          structuredLog('ERROR', 'gemini_segment_failed', {
+            jobId,
+            segmentIndex: seg.segmentIndex,
+            range: `${seg.startSec}-${seg.endSec}s`,
+            error: rawReason.slice(0, 300),
+          });
+        }
+      });
+
+      totalFastScanMs = Date.now() - fastScanStartWall;
+
+      const afterFastScan = jobStore.get(jobId);
+      if (!afterFastScan || afterFastScan.status === 'Cancelled') return;
+
+      const completedSegs = segmentSummaries.filter((s) => s.status === 'completed');
+      const failedSegs = segmentSummaries.filter((s) => s.status === 'failed');
+
+      // Never mark Completed if any segment failed — preserve completed segments for targeted retry!
+      if (failedSegs.length > 0) {
+        const firstErr = failedSegs[0].errorMessage || 'Segment analysis failed.';
+        const partialAvailable = completedSegs.length > 0;
+        const partialMerged = partialAvailable
+          ? mergeSegmentAnalyses(Object.values(segmentResultsMap), {
+              totalDurationSec: effectiveDuration,
+              modelVersion: cfg.fastScanModel,
+              partialWarning: `Partial results shown: ${completedSegs.length}/${plannedSegments.length} segments completed. Click Retry AI Analysis to retry only the ${failedSegs.length} failed segment(s).`,
+            })
+          : undefined;
+
+        afterFastScan.status = 'Failed';
+        afterFastScan.progress = Math.round(
+          (completedSegs.length / Math.max(1, plannedSegments.length)) * 100
+        );
+        afterFastScan.stageMessage = partialAvailable
+          ? `${completedSegs.length}/${plannedSegments.length} segments saved; ${failedSegs.length} failed.`
+          : 'AI video analysis failed.';
+        afterFastScan.errorMessage = partialAvailable
+          ? `${completedSegs.length} of ${plannedSegments.length} segments completed and were preserved. ${failedSegs.length} segment(s) failed: ${firstErr} Click Retry AI Analysis to retry only the failed segment(s).`
+          : firstErr;
+        afterFastScan.processingTimeMs = Date.now() - startedAt;
+        afterFastScan.analyzedFrames = totalFramesAnalyzed;
+        afterFastScan.timings = {
+          preparationMs: totalPrepMs,
+          fastScanMs: totalFastScanMs,
+          detailedAnalysisMs: 0,
+          mergeMs: 0,
+          totalMs: Date.now() - startedAt,
+          cacheHit: false,
+          framesAnalyzed: totalFramesAnalyzed,
+          segmentsTotal: plannedSegments.length,
+          segmentsCompleted: completedSegs.length,
+          segmentsFailed: failedSegs.length,
+          detailedMomentsRefined: 0,
+        };
+        if (partialMerged) {
+          afterFastScan.resultPayload = {
+            videoMetadata,
+            geminiAnalysis: partialMerged,
+            detectionsSummary: buildDetectionsSummaryFromGemini(partialMerged),
+            tracks: [],
+            conflicts: [],
+            detections: [],
+            trajectories: [],
+            events: [],
+          };
+        }
+        afterFastScan.updatedAt = new Date().toISOString();
+        persistJobsSnapshot();
+        return;
+      }
+
+      // Merge all completed Fast Scan segments
+      const mergeStart = Date.now();
+      const mergedAnalysis = mergeSegmentAnalyses(Object.values(segmentResultsMap), {
+        totalDurationSec: effectiveDuration,
+        modelVersion: cfg.fastScanModel,
+      });
+
+      // Stage B — Selective Detailed Analysis ONLY on flagged high-priority moments
+      let detailedAnalysisMs = 0;
+      let detailedMomentsRefined = 0;
+      const detailedTargets = selectDetailedTargetWindows(
+        mergedAnalysis,
+        qualityMode,
+        effectiveDuration
+      );
+
+      if (detailedTargets.length > 0) {
+        afterFastScan.status = 'Detailed Analysis';
+        afterFastScan.progress = 80;
+        afterFastScan.stageMessage = `Detailed Analysis (${cfg.detailedModel}): inspecting ${detailedTargets.length} flagged moment(s)...`;
+        afterFastScan.updatedAt = new Date().toISOString();
+        persistJobsSnapshot();
+
+        const detailStart = Date.now();
+        await runWithBoundedConcurrency(detailedTargets, 2, async (target, idx) => {
+          const liveJob = jobStore.get(jobId);
+          if (!liveJob || liveJob.status === 'Cancelled') return;
+          try {
+            const winSpan = Math.max(0.5, target.windowEndSec - target.windowStartSec);
+            const count = cfg.detailedFramesPerMoment;
+            const sampleTs: number[] = [];
+            for (let i = 0; i < count; i++) {
+              const frac = count === 1 ? 0.5 : i / (count - 1);
+              sampleTs.push(
+                Number(
+                  Math.min(effectiveDuration, target.windowStartSec + winSpan * frac).toFixed(2)
+                )
+              );
+            }
+            const closerFrames = await extractSampledFrames(
+              localFile.fullPath,
+              sampleTs,
+              cfg.detailedFrameWidthPx,
+              Math.max(4, cfg.jpegQuality - 1)
+            );
+            if (closerFrames.length === 0) return;
+            totalFramesAnalyzed += closerFrames.length;
+
+            const ev = mergedAnalysis.events[target.eventIndex];
+            if (!ev) return;
+
+            const detailPrompt = buildDetailedMomentPrompt({
+              windowStartSec: target.windowStartSec,
+              windowEndSec: target.windowEndSec,
+              initialEvent: ev.event,
+              initialReason: ev.reason,
+              frameLabels: closerFrames.map((f) => f.timestampLabel),
+            });
+
+            const detailRes = await callGeminiWithBackoff(
+              `Gemini Detailed Analysis moment ${idx + 1}`,
+              GEMINI_SEGMENT_TIMEOUT_MS,
+              async () =>
+                ai.models.generateContent({
+                  model: cfg.detailedModel,
+                  contents: buildFrameParts(closerFrames, detailPrompt),
+                  config: {
+                    responseMimeType: 'application/json',
+                    responseSchema: GEMINI_DETAILED_MOMENT_SCHEMA,
+                    thinkingConfig: {
+                      thinkingLevel: toThinkingLevel(cfg.detailedThinkingLevel),
+                    },
+                  },
+                }),
+              1
+            );
+
+            const parsedDetail = JSON.parse((detailRes.text || '{}').trim()) as {
+              refined_event?: string;
+              refined_activity?: string;
+              refined_risk_level?: string;
+              refined_confidence?: string;
+              detailed_reason?: string;
+              safety_note?: string;
+            };
+
+            if (parsedDetail.refined_event && parsedDetail.refined_event.trim().length > 2) {
+              ev.event = parsedDetail.refined_event.trim().slice(0, 500);
+            }
+            if (parsedDetail.refined_activity && parsedDetail.refined_activity.trim().length > 2) {
+              ev.activity = parsedDetail.refined_activity.trim().slice(0, 300);
+            }
+            if (
+              parsedDetail.refined_risk_level === 'low' ||
+              parsedDetail.refined_risk_level === 'medium' ||
+              parsedDetail.refined_risk_level === 'high' ||
+              parsedDetail.refined_risk_level === 'critical'
+            ) {
+              ev.risk_level = parsedDetail.refined_risk_level;
+            }
+            if (
+              parsedDetail.refined_confidence === 'low' ||
+              parsedDetail.refined_confidence === 'medium' ||
+              parsedDetail.refined_confidence === 'high'
+            ) {
+              ev.confidence = parsedDetail.refined_confidence;
+            }
+            if (parsedDetail.detailed_reason && parsedDetail.detailed_reason.trim().length > 3) {
+              ev.reason = parsedDetail.detailed_reason.trim().slice(0, 500);
+            }
+            if (parsedDetail.safety_note && parsedDetail.safety_note.trim().length > 3) {
+              const note = parsedDetail.safety_note.trim().slice(0, 400);
+              if (
+                !mergedAnalysis.safety_observations.some(
+                  (s) => s.toLowerCase() === note.toLowerCase()
+                )
+              ) {
+                mergedAnalysis.safety_observations.push(note);
+              }
+            }
+            detailedMomentsRefined++;
+          } catch (detailErr) {
+            // Preserve Fast Scan results if Stage B refinement fails transiently
+            structuredLog('WARN', 'gemini_detailed_moment_skipped', {
+              jobId,
+              momentIndex: idx,
+              error: detailErr instanceof Error ? detailErr.message.slice(0, 180) : 'detail_error',
+            });
+            afterFastScan.warnings.push(
+              `Detailed pass skipped for moment at ${formatSecondsToTimestamp(target.centerSec)}; Fast Scan observation preserved.`
+            );
+          }
+        });
+        detailedAnalysisMs = Date.now() - detailStart;
+      }
+
+      const finalCheck = jobStore.get(jobId);
+      if (!finalCheck || finalCheck.status === 'Cancelled') return;
+
+      finalCheck.status = 'Saving Results';
+      finalCheck.progress = 92;
+      finalCheck.stageMessage = 'Validating merged timeline and saving structured results...';
+      finalCheck.updatedAt = new Date().toISOString();
+      persistJobsSnapshot();
+
+      const effectiveModelLabel =
+        detailedMomentsRefined > 0
+          ? `${cfg.fastScanModel} + ${cfg.detailedModel}`
+          : cfg.fastScanModel;
+      mergedAnalysis.model_version = effectiveModelLabel;
+      mergedAnalysis.analyzed_at = new Date().toISOString();
+
+      const detectionsSummary = buildDetectionsSummaryFromGemini(mergedAnalysis);
+      const conflictEvents = mapGeminiAnalysisToConflictEvents(mergedAnalysis, {
+        videoId: finalCheck.videoId,
+        projectId: finalCheck.projectId,
+        locationId: finalCheck.locationId,
+        ownerId: finalCheck.ownerId,
+        fps: effectiveFps,
+        occurredAtIso: finalCheck.occurredAtIso,
+        jobId,
+      });
+
+      const mergeMs = Math.max(1, Date.now() - mergeStart - detailedAnalysisMs);
+      const totalMs = Date.now() - startedAt;
+
+      const timings: ProcessingTimings = {
+        preparationMs: totalPrepMs,
+        fastScanMs: totalFastScanMs,
+        detailedAnalysisMs,
+        mergeMs,
+        totalMs,
+        cacheHit: false,
+        framesAnalyzed: totalFramesAnalyzed,
+        segmentsTotal: plannedSegments.length,
+        segmentsCompleted: completedSegs.length,
+        segmentsFailed: 0,
+        detailedMomentsRefined,
+      };
+
+      // Save to reusable content-hash cache
+      analysisCache.set(cacheKey, {
+        cacheKey,
+        qualityMode,
+        modelVersion: effectiveModelLabel,
         videoMetadata,
-        geminiAnalysis,
+        geminiAnalysis: mergedAnalysis,
+        framesAnalyzed: totalFramesAnalyzed,
+        segmentsTotal: plannedSegments.length,
+        detailedMomentsRefined,
+        cachedAt: mergedAnalysis.analyzed_at,
+      });
+      persistAnalysisCache();
+
+      finalCheck.status = 'Completed';
+      finalCheck.progress = 100;
+      finalCheck.stageMessage = `Completed (${cfg.label} mode · ${(totalMs / 1000).toFixed(1)}s · ${totalFramesAnalyzed} keyframes).`;
+      finalCheck.engineMode = 'GEMINI_AI';
+      finalCheck.modelVersion = effectiveModelLabel;
+      finalCheck.analyzedFrames = totalFramesAnalyzed;
+      finalCheck.detectedObjectCount = detectionsSummary.total_detections;
+      finalCheck.trackingCount = mergedAnalysis.events.length;
+      finalCheck.conflictCount = conflictEvents.length;
+      finalCheck.processingTimeMs = totalMs;
+      finalCheck.timings = timings;
+      finalCheck.resultPayload = {
+        videoMetadata,
+        geminiAnalysis: mergedAnalysis,
         detectionsSummary,
         tracks: [],
         conflicts: [],
@@ -1129,18 +1777,18 @@ function executeJobAsync(jobId: string) {
         trajectories: [],
         events: conflictEvents,
       };
-      postAnalysisCheck.updatedAt = new Date().toISOString();
+      finalCheck.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
 
       structuredLog('INFO', 'processing_job_completed', {
         jobId,
-        engineMode: postAnalysisCheck.engineMode,
-        modelVersion: postAnalysisCheck.modelVersion,
+        qualityMode,
+        modelVersion: effectiveModelLabel,
         durationSec: effectiveDuration,
-        detectedObjects: postAnalysisCheck.detectedObjectCount,
-        timelineEvents: geminiAnalysis.events.length,
+        timings,
+        detectedObjects: finalCheck.detectedObjectCount,
+        timelineEvents: mergedAnalysis.events.length,
         safetyConflictEvents: conflictEvents.length,
-        processingTimeMs: postAnalysisCheck.processingTimeMs,
       });
     } catch (err) {
       const target = jobStore.get(jobId);
@@ -1158,24 +1806,8 @@ function executeJobAsync(jobId: string) {
         videoId: target.videoId,
         error: err instanceof Error ? err.message.slice(0, 300) : 'gemini_analysis_failed',
       });
-    } finally {
-      if (uploadedGeminiFileName && ai) {
-        try {
-          await ai.files.delete({ name: uploadedGeminiFileName });
-          structuredLog('INFO', 'gemini_temp_file_deleted', {
-            jobId,
-            fileName: uploadedGeminiFileName,
-          });
-        } catch (cleanupErr) {
-          structuredLog('WARN', 'gemini_temp_file_delete_failed', {
-            jobId,
-            fileName: uploadedGeminiFileName,
-            error: cleanupErr instanceof Error ? cleanupErr.message.slice(0, 160) : 'cleanup_failed',
-          });
-        }
-      }
     }
-  }, 150);
+  }, 80);
 }
 
 async function startServer() {
@@ -1368,7 +2000,7 @@ async function startServer() {
     }
   );
 
-  // --- Asynchronous Real CV Processing Jobs ---
+  // --- Asynchronous Optimized Gemini AI Processing Jobs ---
   const createJobSchema = z.object({
     videoId: z.string().min(1).max(128).regex(/^[a-zA-Z0-9_\-]+$/),
     projectId: z.string().min(1).max(128).regex(/^[a-zA-Z0-9_\-]+$/),
@@ -1376,6 +2008,8 @@ async function startServer() {
     fileUrl: z.string().min(1).max(512),
     durationSec: z.number().min(0).max(86400).default(0),
     occurredAtIso: z.string().max(64).optional(),
+    analysisQuality: z.enum(['fast', 'balanced', 'detailed']).optional(),
+    forceRefresh: z.boolean().optional(),
   });
 
   app.post(
@@ -1433,6 +2067,7 @@ async function startServer() {
       const jobId = `job_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const nowIso = new Date().toISOString();
       const geminiConfigured = Boolean(getGeminiClient());
+      const analysisQuality = normalizeQualityMode(data.analysisQuality);
 
       const job: ServerJob = {
         id: jobId,
@@ -1444,11 +2079,13 @@ async function startServer() {
         durationSec: data.durationSec,
         occurredAtIso: data.occurredAtIso || nowIso,
         analysisMode: 'REAL',
+        analysisQuality,
+        forceRefresh: Boolean(data.forceRefresh),
         status: 'Queued',
         progress: 5,
-        stageMessage: 'Queued for Gemini AI video analysis...',
+        stageMessage: `Queued for ${QUALITY_MODE_CONFIGS[analysisQuality].label} Gemini AI analysis...`,
         engineMode: 'GEMINI_AI',
-        modelVersion: geminiConfigured ? GEMINI_VIDEO_MODEL : 'Gemini API Not Configured',
+        modelVersion: geminiConfigured ? GEMINI_FAST_SCAN_MODEL : 'Gemini API Not Configured',
         analyzedFrames: 0,
         processingTimeMs: 0,
         detectedObjectCount: 0,
@@ -1476,7 +2113,7 @@ async function startServer() {
       .filter((j) => (!projectId || projectId === 'ALL' ? true : j.projectId === projectId))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 40)
-      .map(({ resultPayload: _omit, ...summary }) => summary);
+      .map(({ resultPayload: _omit, segmentResultsCache: _omitSegs, ...summary }) => summary);
     res.json({ jobs });
   });
 
@@ -1491,7 +2128,8 @@ async function startServer() {
       res.status(403).json({ error: 'Access denied to this processing job.' });
       return;
     }
-    res.json({ job });
+    const { segmentResultsCache: _omitSegs, ...publicJob } = job;
+    res.json({ job: publicJob });
   });
 
   app.post(
@@ -1516,11 +2154,13 @@ async function startServer() {
       job.stageMessage = 'Analysis cancelled by user.';
       job.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
-      res.json({ job });
+      const { segmentResultsCache: _omitSegs, ...publicJob } = job;
+      res.json({ job: publicJob });
     }
   );
 
-  // Retry a Failed, Cancelled, or Completed processing job without re-uploading the video
+  // Retry a Failed, Cancelled, or Completed processing job without re-uploading the video.
+  // Automatically preserves any completed segments and retries only failed segments!
   app.post(
     '/api/processing/jobs/:jobId/retry',
     requireAuth(['ADMINISTRATOR', 'ANALYST']),
@@ -1561,18 +2201,44 @@ async function startServer() {
         });
         return;
       }
+
+      const requestedQuality =
+        req.body && typeof req.body === 'object' && 'analysisQuality' in req.body
+          ? normalizeQualityMode((req.body as { analysisQuality?: unknown }).analysisQuality)
+          : job.analysisQuality || 'balanced';
+      const isQualityChange = requestedQuality !== job.analysisQuality;
+      const wasCompleted = job.status === 'Completed';
+      const hasFailedSegments = Boolean(job.segments?.some((s) => s.status === 'failed'));
+
+      // If user explicitly re-runs a Completed job or switches quality mode, clear segment cache & force fresh pass
+      if (wasCompleted || isQualityChange) {
+        job.segments = undefined;
+        job.segmentResultsCache = undefined;
+        job.resultPayload = undefined;
+        job.forceRefresh = true;
+      } else {
+        // Keep completed segments intact so only failed segments are retried!
+        job.forceRefresh = Boolean(
+          req.body && typeof req.body === 'object' && (req.body as { forceRefresh?: boolean }).forceRefresh
+        );
+      }
+
+      job.analysisQuality = requestedQuality;
       job.status = 'Queued';
       job.progress = 5;
-      job.stageMessage = 'Re-queued for Gemini AI video analysis...';
+      job.stageMessage = hasFailedSegments && !isQualityChange
+        ? 'Re-queued to retry failed segments only...'
+        : `Re-queued for ${QUALITY_MODE_CONFIGS[requestedQuality].label} Gemini AI analysis...`;
       job.engineMode = 'GEMINI_AI';
-      job.modelVersion = getGeminiClient() ? GEMINI_VIDEO_MODEL : 'Gemini API Not Configured';
+      job.modelVersion = getGeminiClient() ? GEMINI_FAST_SCAN_MODEL : 'Gemini API Not Configured';
       job.errorMessage = undefined;
       job.warnings = [];
-      job.resultPayload = undefined;
       job.updatedAt = new Date().toISOString();
       persistJobsSnapshot();
       executeJobAsync(job.id);
-      res.status(202).json({ job });
+
+      const { segmentResultsCache: _omitSegs, ...publicJob } = job;
+      res.status(202).json({ job: publicJob });
     }
   );
 

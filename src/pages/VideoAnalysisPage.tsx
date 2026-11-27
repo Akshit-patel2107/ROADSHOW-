@@ -22,7 +22,7 @@ import {
 import { useRoadshadow } from '../context/RoadshadowContext';
 import { RiskIndicator } from '../components/RiskBadge';
 import { canPerformAction } from '../engine/validation';
-import type { DetectedObjectClass, GeminiRiskLevel } from '../types/roadshadow';
+import type { AnalysisQualityMode, DetectedObjectClass, GeminiRiskLevel } from '../types/roadshadow';
 
 const CLASS_STYLE: Record<DetectedObjectClass, { stroke: string; label: string }> = {
   person: { stroke: '#E5484D', label: 'Person' },
@@ -160,6 +160,7 @@ export function VideoAnalysisPage() {
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [liveRetryStage, setLiveRetryStage] = useState<string | null>(null);
+  const [retryQuality, setRetryQuality] = useState<AnalysisQualityMode>('balanced');
 
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
@@ -410,11 +411,15 @@ export function VideoAnalysisPage() {
   const handleRunAiAnalysis = async () => {
     if (!selectedVideo || retrying) return;
     setRetrying(true);
-    setLiveRetryStage('Submitting video to Gemini AI pipeline...');
+    setLiveRetryStage(`Submitting video to Gemini AI (${retryQuality} mode)...`);
     try {
-      await retryVideoAnalysis(selectedVideo.id, (jobUpdate) => {
-        setLiveRetryStage(jobUpdate.stageMessage || `${jobUpdate.status} (${jobUpdate.progressPercent}%)`);
-      });
+      await retryVideoAnalysis(
+        selectedVideo.id,
+        (jobUpdate) => {
+          setLiveRetryStage(jobUpdate.stageMessage || `${jobUpdate.status} (${jobUpdate.progress}%)`);
+        },
+        retryQuality
+      );
     } finally {
       setRetrying(false);
       setLiveRetryStage(null);
@@ -444,7 +449,7 @@ export function VideoAnalysisPage() {
                 : selectedVideo.status === 'Failed'
                   ? 'Stored Video · AI Analysis Failed'
                   : geminiAnalysis || relatedJob?.engineMode === 'GEMINI_AI'
-                    ? `Gemini AI Video Analysis (${geminiAnalysis?.model_version || relatedJob?.modelVersion || 'gemini-4-hydrogen'})`
+                    ? `Gemini AI Video Analysis (${geminiAnalysis?.model_version || relatedJob?.modelVersion || 'gemini-3.1-flash-lite'})`
                     : 'Stored Video'}
             </span>
           </p>
@@ -452,20 +457,33 @@ export function VideoAnalysisPage() {
 
         <div className="flex flex-wrap items-center gap-2">
           {!selectedVideo.isDemonstration && selectedVideo.status === 'Completed' && canRetry && (
-            <button
-              type="button"
-              disabled={retrying}
-              onClick={handleRunAiAnalysis}
-              data-testid="rerun-ai-analysis-btn"
-              className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#122943] hover:bg-[#173252] border border-[#233B56] disabled:opacity-50 text-[#F5F8FC] text-xs font-medium rounded-md whitespace-nowrap"
-            >
-              {retrying ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#45B5FF]" />
-              ) : (
-                <RefreshCw className="w-3.5 h-3.5 text-[#45B5FF]" />
-              )}
-              {retrying ? 'Re-analysing...' : 'Re-run AI Analysis'}
-            </button>
+            <>
+              <select
+                aria-label="Re-analysis quality mode"
+                value={retryQuality}
+                disabled={retrying}
+                onChange={(e) => setRetryQuality(e.target.value as AnalysisQualityMode)}
+                className="bg-[#122943] border border-[#233B56] text-[#A9B8CA] text-xs rounded-md px-2 py-2 focus:outline-none focus:ring-2 focus:ring-[#2585FF]"
+              >
+                <option value="fast">Fast</option>
+                <option value="balanced">Balanced</option>
+                <option value="detailed">Detailed</option>
+              </select>
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={handleRunAiAnalysis}
+                data-testid="rerun-ai-analysis-btn"
+                className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#122943] hover:bg-[#173252] border border-[#233B56] disabled:opacity-50 text-[#F5F8FC] text-xs font-medium rounded-md whitespace-nowrap"
+              >
+                {retrying ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#45B5FF]" />
+                ) : (
+                  <RefreshCw className="w-3.5 h-3.5 text-[#45B5FF]" />
+                )}
+                {retrying ? 'Re-analysing...' : 'Re-run AI Analysis'}
+              </button>
+            </>
           )}
           <label htmlFor="video-selector" className="sr-only">
             Select analysed video
@@ -948,6 +966,7 @@ export function VideoAnalysisPage() {
                 <p>
                   <span className="text-[#F5F8FC] font-medium">Model / Engine:</span>{' '}
                   {relatedJob?.modelVersion || 'No processing job metadata'}
+                  {relatedJob?.analysisQuality ? ` · ${relatedJob.analysisQuality} mode` : ''}
                 </p>
                 {selectedVideo.width && selectedVideo.height && (
                   <p className="font-mono text-[#A9B8CA]">
@@ -956,6 +975,31 @@ export function VideoAnalysisPage() {
                   </p>
                 )}
               </div>
+
+              {/* Real Measured Pipeline Stage Timings */}
+              {relatedJob?.timings && (
+                <div
+                  data-testid="analysis-timings-bar"
+                  className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-2 border-t border-[#233B56]/70 text-[11px] font-mono"
+                >
+                  <div className="px-2.5 py-1.5 rounded bg-[#0D1F35] border border-[#233B56]">
+                    Prep: <span className="text-[#F5F8FC]">{(relatedJob.timings.preparationMs / 1000).toFixed(2)}s</span>
+                  </div>
+                  <div className="px-2.5 py-1.5 rounded bg-[#0D1F35] border border-[#233B56]">
+                    Fast Scan: <span className="text-[#F5F8FC]">{(relatedJob.timings.fastScanMs / 1000).toFixed(2)}s</span>
+                  </div>
+                  <div className="px-2.5 py-1.5 rounded bg-[#0D1F35] border border-[#233B56]">
+                    Detailed: <span className="text-[#F5F8FC]">{(relatedJob.timings.detailedAnalysisMs / 1000).toFixed(2)}s</span>
+                  </div>
+                  <div className="px-2.5 py-1.5 rounded bg-[#0D1F35] border border-[#233B56]">
+                    Segments: <span className="text-[#F5F8FC]">{relatedJob.timings.segmentsCompleted}/{relatedJob.timings.segmentsTotal}</span>
+                  </div>
+                  <div className="px-2.5 py-1.5 rounded bg-[#0D1F35] border border-[#233B56]">
+                    Total: <span className="text-[#22C55E]">{(relatedJob.timings.totalMs / 1000).toFixed(2)}s</span>
+                    {relatedJob.timings.cacheHit ? ' · cache' : ''}
+                  </div>
+                </div>
+              )}
 
               {/* Detections Summary by Class */}
               <div data-testid="detections-by-class-grid" className="pt-2 border-t border-[#233B56]/70">

@@ -41,6 +41,9 @@ export type ProcessingStatus =
   | 'Uploading'
   | 'Uploaded'
   | 'Queued'
+  | 'Preparing Video'
+  | 'Fast Scan'
+  | 'Detailed Analysis'
   | 'Analyzing'
   | 'Processing'
   | 'AI Analysis'
@@ -48,6 +51,33 @@ export type ProcessingStatus =
   | 'Completed'
   | 'Failed'
   | 'Cancelled';
+
+export type AnalysisQualityMode = 'fast' | 'balanced' | 'detailed';
+
+export interface SegmentProgressSummary {
+  segmentIndex: number;
+  startSec: number;
+  endSec: number;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  framesSent?: number;
+  prepMs?: number;
+  modelMs?: number;
+  errorMessage?: string;
+}
+
+export interface ProcessingTimings {
+  preparationMs: number;
+  fastScanMs: number;
+  detailedAnalysisMs: number;
+  mergeMs: number;
+  totalMs: number;
+  cacheHit: boolean;
+  framesAnalyzed: number;
+  segmentsTotal: number;
+  segmentsCompleted: number;
+  segmentsFailed: number;
+  detailedMomentsRefined: number;
+}
 
 export type EngineMode = 'GEMINI_AI' | 'CV_SERVICE' | 'DEVELOPMENT_FALLBACK' | 'DEMONSTRATION';
 
@@ -321,6 +351,9 @@ export interface ProcessingJob {
   ownerId: string;
   status:
     | 'Queued'
+    | 'Preparing Video'
+    | 'Fast Scan'
+    | 'Detailed Analysis'
     | 'Analyzing'
     | 'Processing'
     | 'AI Analysis'
@@ -330,6 +363,9 @@ export interface ProcessingJob {
     | 'Cancelled';
   progress: number;
   stageMessage?: string;
+  analysisQuality?: AnalysisQualityMode;
+  segments?: SegmentProgressSummary[];
+  timings?: ProcessingTimings;
   engineMode: EngineMode;
   modelVersion: string;
   analyzedFrames: number;

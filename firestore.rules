@@ -214,7 +214,7 @@ service cloud.firestore {
         isValidString(data.roadType, 2, 80) &&
         isOptionalString(data, 'description', 1000) &&
         data.durationSec is number && data.durationSec >= 0 && data.durationSec <= 86400 &&
-        data.status in ['Draft', 'Uploading', 'Uploaded', 'Queued', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
+        data.status in ['Draft', 'Uploading', 'Uploaded', 'Queued', 'Preparing Video', 'Fast Scan', 'Detailed Analysis', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
         data.isDemonstration is bool &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
@@ -243,13 +243,14 @@ service cloud.firestore {
 
     function isValidProcessingJob(data) {
       return data.keys().hasAll(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'stageMessage', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['videoId', 'projectId', 'ownerId', 'status', 'progress', 'stageMessage', 'analysisQuality', 'engineMode', 'modelVersion', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'createdAt', 'updatedAt']) &&
         isValidId(data.videoId) &&
         isValidId(data.projectId) &&
         isValidId(data.ownerId) &&
-        data.status in ['Queued', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
+        data.status in ['Queued', 'Preparing Video', 'Fast Scan', 'Detailed Analysis', 'Analyzing', 'Processing', 'AI Analysis', 'Saving Results', 'Completed', 'Failed', 'Cancelled'] &&
         data.progress is number && data.progress >= 0 && data.progress <= 100 &&
         isOptionalString(data, 'stageMessage', 300) &&
+        (!('analysisQuality' in data) || data.analysisQuality in ['fast', 'balanced', 'detailed']) &&
         data.engineMode in ['GEMINI_AI', 'CV_SERVICE', 'DEVELOPMENT_FALLBACK', 'DEMONSTRATION', 'UNAVAILABLE'] &&
         isValidString(data.modelVersion, 2, 120) &&
         data.analyzedFrames is number && data.analyzedFrames >= 0 &&
@@ -598,7 +599,7 @@ service cloud.firestore {
           (
             existing().ownerId == request.auth.uid &&
             !(existing().status in ['Completed', 'Failed', 'Cancelled']) &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'progress', 'stageMessage', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'progress', 'stageMessage', 'analysisQuality', 'analyzedFrames', 'processingTimeMs', 'detectedObjectCount', 'trackingCount', 'conflictCount', 'warnings', 'errorMessage', 'updatedAt'])
           )
         );
       allow delete: if isValidId(jobId) && (isOwnerUid(existing().ownerId) || isAdmin());

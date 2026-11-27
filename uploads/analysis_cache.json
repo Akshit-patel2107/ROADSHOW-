@@ -1,0 +1,165 @@
+[
+  {
+    "cacheKey": "20437aa6273706b3487987d5d1d221b28fa5b55f1227c7d0a25c4c9c086517ee:balanced",
+    "qualityMode": "balanced",
+    "modelVersion": "gemini-3.1-flash-lite",
+    "videoMetadata": {
+      "fps": 25,
+      "width": 640,
+      "height": 360,
+      "resolution": "640x360",
+      "duration": 40
+    },
+    "geminiAnalysis": {
+      "video_summary": "[00:00:00–00:00:20] The video displays a synthetic diagnostic test pattern characterized by vibrant vertical color bars, changing geometric shapes, and a moving diagonal color gradient line. There are no real-world vehicles, people, or road environments present. [00:00:20–00:00:40] The footage displays a computer-generated abstract animation featuring a shifting colorful background with moving geometric shapes, a grid pattern, and fluctuating numerical data, suggesting a technical or diagnostic test pattern.",
+      "duration_seconds": 40,
+      "events": [],
+      "detected_objects": [
+        {
+          "label": "geometric patterns",
+          "count_estimate": 1,
+          "notes": "Static and dynamic synthetic shapes including squares, lines, and a checkerboard pattern."
+        },
+        {
+          "label": "geometric shapes",
+          "count_estimate": 10,
+          "notes": "Includes various squares, lines, and patterns moving across the screen."
+        },
+        {
+          "label": "numerical data display",
+          "count_estimate": 1,
+          "notes": "A text counter in the upper left corner showing changing numerical values."
+        }
+      ],
+      "important_moments": [
+        {
+          "timestamp": "00:00:00",
+          "timestamp_sec": 0,
+          "is_approximate": false,
+          "description": "Start of the diagnostic pattern animation."
+        },
+        {
+          "timestamp": "00:00:20",
+          "timestamp_sec": 20,
+          "is_approximate": false,
+          "description": "Initial state of the test pattern with geometric shapes."
+        },
+        {
+          "timestamp": "00:00:39",
+          "timestamp_sec": 39,
+          "is_approximate": false,
+          "description": "Final state of the test pattern before the video concludes."
+        }
+      ],
+      "safety_observations": [
+        "This is a synthetic digital graphic, not actual road footage.",
+        "No safety or traffic-related observations possible.",
+        "The video consists of synthetic, non-real-world visual content.",
+        "No road infrastructure, vehicles, or pedestrians are present."
+      ],
+      "overall_assessment": "The footage contains exclusively synthetic, non-traffic related test imagery; therefore, no road safety or traffic assessments apply. The video is a graphical test pattern containing no real-world traffic or safety-relevant content.",
+      "model_version": "gemini-3.1-flash-lite",
+      "analyzed_at": "2026-11-27T03:30:33.393Z"
+    },
+    "framesAnalyzed": 16,
+    "segmentsTotal": 2,
+    "detailedMomentsRefined": 0,
+    "cachedAt": "2026-11-27T03:30:33.393Z"
+  },
+  {
+    "cacheKey": "b4f2561b894e69f72423af9c838425fdb2374d3dbcc33f0b9250c51ac53ad7d0:fast",
+    "qualityMode": "fast",
+    "modelVersion": "gemini-3.1-flash-lite",
+    "videoMetadata": {
+      "fps": 25,
+      "width": 640,
+      "height": 360,
+      "resolution": "640x360",
+      "duration": 4
+    },
+    "geminiAnalysis": {
+      "video_summary": "The video shows a digital test pattern with shifting geometric shapes, colors, and a counter incrementing from 0 to 95.",
+      "duration_seconds": 4,
+      "events": [],
+      "detected_objects": [
+        {
+          "label": "digital graphic elements",
+          "count_estimate": 5,
+          "notes": "Includes colored stripes, a counter, a diagonal line, a grid, and changing shapes."
+        }
+      ],
+      "important_moments": [
+        {
+          "timestamp": "00:00:00",
+          "timestamp_sec": 0,
+          "is_approximate": false,
+          "description": "The video begins displaying a colorful vertical stripe pattern with a counter at 0."
+        },
+        {
+          "timestamp": "00:00:03",
+          "timestamp_sec": 3,
+          "is_approximate": false,
+          "description": "The counter reaches 95 as the graphic elements continue to evolve on screen."
+        }
+      ],
+      "safety_observations": [
+        "This is a digital synthetic test pattern and does not represent real-world traffic or road conditions."
+      ],
+      "overall_assessment": "The video is a non-traffic-related digital animation or test pattern; there are no road safety incidents or traffic interactions to report.",
+      "model_version": "gemini-3.1-flash-lite",
+      "analyzed_at": "2026-11-27T03:30:27.766Z"
+    },
+    "framesAnalyzed": 4,
+    "segmentsTotal": 1,
+    "detailedMomentsRefined": 0,
+    "cachedAt": "2026-11-27T03:30:27.766Z"
+  },
+  {
+    "cacheKey": "b4f2561b894e69f72423af9c838425fdb2374d3dbcc33f0b9250c51ac53ad7d0:balanced",
+    "qualityMode": "balanced",
+    "modelVersion": "gemini-3.1-flash-lite",
+    "videoMetadata": {
+      "fps": 25,
+      "width": 640,
+      "height": 360,
+      "resolution": "640x360",
+      "duration": 4
+    },
+    "geminiAnalysis": {
+      "video_summary": "The video shows a synthetic, abstract animation featuring geometric shapes, colored vertical bars, and changing light patterns over a 4-second duration.",
+      "duration_seconds": 4,
+      "events": [],
+      "detected_objects": [
+        {
+          "label": "geometric patterns",
+          "count_estimate": 5,
+          "notes": "Includes shifting squares, a cross-shape, and a multicolored diagonal beam."
+        }
+      ],
+      "important_moments": [
+        {
+          "timestamp": "00:00:00",
+          "timestamp_sec": 0,
+          "is_approximate": false,
+          "description": "The animation begins with vertical color bars and a diagonal beam."
+        },
+        {
+          "timestamp": "00:00:02",
+          "timestamp_sec": 2,
+          "is_approximate": false,
+          "description": "A cross-shaped figure appears in the center."
+        }
+      ],
+      "safety_observations": [
+        "The video is entirely synthetic with no real-world road traffic or safety-relevant elements."
+      ],
+      "overall_assessment": "This is a computer-generated animation with no actual road-user presence or traffic safety concerns.",
+      "model_version": "gemini-3.1-flash-lite",
+      "analyzed_at": "2026-11-27T03:30:23.340Z"
+    },
+    "framesAnalyzed": 4,
+    "segmentsTotal": 1,
+    "detailedMomentsRefined": 0,
+    "cachedAt": "2026-11-27T03:30:23.340Z"
+  }
+]

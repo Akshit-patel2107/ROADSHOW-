@@ -30,6 +30,7 @@ import {
 } from '../lib/firebase';
 import type {
   ActiveCameraSource,
+  AnalysisQualityMode,
   AppNotification,
   AuditLogEntry,
   Camera,
@@ -179,7 +180,8 @@ interface RoadshadowContextValue {
   deleteVideo: (videoId: string) => Promise<void>;
   retryVideoAnalysis: (
     videoId: string,
-    onProgress?: (job: ProcessingJob) => void
+    onProgress?: (job: ProcessingJob) => void,
+    analysisQuality?: AnalysisQualityMode
   ) => Promise<{ ok: boolean; status: string; error?: string; job?: ProcessingJob }>;
 
   reviewConflictEvent: (
@@ -1452,6 +1454,9 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           'Uploading',
           'Uploaded',
           'Queued',
+          'Preparing Video',
+          'Fast Scan',
+          'Detailed Analysis',
           'Analyzing',
           'Processing',
           'AI Analysis',
@@ -1553,6 +1558,9 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         const safeJobId = sanitizeFirestoreId(job.id);
         const allowedJobStatuses: Array<ProcessingJob['status']> = [
           'Queued',
+          'Preparing Video',
+          'Fast Scan',
+          'Detailed Analysis',
           'Analyzing',
           'Processing',
           'AI Analysis',
@@ -1571,8 +1579,14 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         const safeEngineMode = allowedEngineModes.includes(job.engineMode)
           ? job.engineMode
           : 'GEMINI_AI';
-        const rawModelVer = (job.modelVersion || 'gemini-4-hydrogen').trim();
-        const safeModelVer = (rawModelVer.length >= 2 ? rawModelVer : 'gemini-4-hydrogen').slice(0, 120);
+        const rawModelVer = (job.modelVersion || 'gemini-3.1-flash-lite').trim();
+        const safeModelVer = (rawModelVer.length >= 2 ? rawModelVer : 'gemini-3.1-flash-lite').slice(0, 120);
+        const safeAnalysisQuality =
+          job.analysisQuality === 'fast' ||
+          job.analysisQuality === 'balanced' ||
+          job.analysisQuality === 'detailed'
+            ? job.analysisQuality
+            : undefined;
         const safeWarnings = Array.isArray(job.warnings)
           ? job.warnings
               .filter((w): w is string => typeof w === 'string' && w.length > 0)
@@ -1589,6 +1603,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
               ? Math.min(100, Math.max(0, Number(job.progress)))
               : 0,
             ...(job.stageMessage ? { stageMessage: job.stageMessage.slice(0, 300) } : {}),
+            ...(safeAnalysisQuality ? { analysisQuality: safeAnalysisQuality } : {}),
             engineMode: safeEngineMode,
             modelVersion: safeModelVer,
             analyzedFrames: Number.isFinite(job.analyzedFrames)
@@ -1842,7 +1857,8 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
   const retryVideoAnalysis = useCallback(
     async (
       videoId: string,
-      onProgress?: (job: ProcessingJob) => void
+      onProgress?: (job: ProcessingJob) => void,
+      analysisQuality?: AnalysisQualityMode
     ): Promise<{ ok: boolean; status: string; error?: string; job?: ProcessingJob }> => {
       if (retryingVideoIdsRef.current.has(videoId)) {
         return {
@@ -1865,20 +1881,46 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
 
       retryingVideoIdsRef.current.add(videoId);
       try {
-        const res = await roadshadowFetch('/api/processing/jobs', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          isDemoMode,
-          demoRole: currentUser.role,
-          body: JSON.stringify({
-            videoId: target.id,
-            projectId: target.projectId,
-            locationId: target.locationId,
-            fileUrl: target.fileUrl,
-            durationSec: target.durationSec || 0,
-            occurredAtIso: `${target.recordingDate}T${target.recordingTime}:00.000Z`,
-          }),
-        });
+        const existingJob = processingJobs
+          .filter((j) => j.videoId === videoId)
+          .sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''))[0];
+        const requestedQuality: AnalysisQualityMode =
+          analysisQuality || existingJob?.analysisQuality || 'balanced';
+
+        // Prefer targeted server /retry endpoint so completed segments are preserved and only failed segments re-run
+        let res: Response | null = null;
+        if (existingJob?.id) {
+          const retryResp = await roadshadowFetch(`/api/processing/jobs/${existingJob.id}/retry`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            isDemoMode,
+            demoRole: currentUser.role,
+            body: JSON.stringify({ analysisQuality: requestedQuality }),
+          });
+          if (retryResp.status !== 404) {
+            res = retryResp;
+          }
+        }
+
+        if (!res) {
+          res = await roadshadowFetch('/api/processing/jobs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            isDemoMode,
+            demoRole: currentUser.role,
+            body: JSON.stringify({
+              videoId: target.id,
+              projectId: target.projectId,
+              locationId: target.locationId,
+              fileUrl: target.fileUrl,
+              durationSec: target.durationSec || 0,
+              occurredAtIso: `${target.recordingDate}T${target.recordingTime}:00.000Z`,
+              analysisQuality: requestedQuality,
+              forceRefresh: target.status === 'Completed',
+            }),
+          });
+        }
+
         const data = await res.json();
         if (!res.ok) {
           const msg = data.error || 'Could not start AI analysis job.';
@@ -1890,7 +1932,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         let finalJob = data.job;
         onProgress?.(finalJob);
         for (let attempt = 0; attempt < 240; attempt += 1) {
-          await new Promise((r) => setTimeout(r, 900));
+          await new Promise((r) => setTimeout(r, 800));
           const poll = await roadshadowFetch(`/api/processing/jobs/${jobId}`, {
             isDemoMode,
             demoRole: currentUser.role,
@@ -1935,8 +1977,9 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           status: finalJob.status,
           progress: finalJob.progress ?? 0,
           stageMessage: finalJob.stageMessage,
+          analysisQuality: finalJob.analysisQuality || requestedQuality,
           engineMode: finalJob.engineMode || 'GEMINI_AI',
-          modelVersion: finalJob.modelVersion || 'gemini-4-hydrogen',
+          modelVersion: finalJob.modelVersion || 'gemini-3.1-flash-lite',
           analyzedFrames: finalJob.analyzedFrames || 0,
           processingTimeMs: finalJob.processingTimeMs || 0,
           detectedObjectCount: finalJob.detectedObjectCount || 0,
@@ -1944,6 +1987,8 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
           conflictCount: finalJob.conflictCount || 0,
           warnings: finalJob.warnings || [],
           errorMessage: finalJob.errorMessage,
+          segments: finalJob.segments,
+          timings: finalJob.timings,
           createdAt: finalJob.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1977,7 +2022,7 @@ export function RoadshadowProvider({ children }: { children: React.ReactNode }) 
         retryingVideoIdsRef.current.delete(videoId);
       }
     },
-    [videos, currentUser, isDemoMode, registerUploadedVideoAndResults, pushToast]
+    [videos, processingJobs, currentUser, isDemoMode, registerUploadedVideoAndResults, pushToast]
   );
 
   // --- Human Validation of Conflict Events (Never overwrites originalConflictType!) ---
